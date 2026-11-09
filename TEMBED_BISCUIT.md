@@ -24,9 +24,27 @@ RESPONSE `…b26a9` (Notify + CCCD), STATUS `…b26aa` (Read JSON). Advertises a
 Framing: newline `TYPE:SUBTYPE:PAYLOAD\n`.
 STATUS JSON: `{"status":0,"battery":100,"op":"wardrive","heap":...,"model":"Biscuit-TEmbed","name":"Biscuit-TEmbed"}`
 
+## Link-code pairing gate
+At boot the board generates a random **6-digit link code** and shows it on the ST7789
+("LINK CODE" + the number). BLE still advertises and connects normally, but the session is
+**LOCKED**: every CMD except `CMD:link:<code>` is ignored until the correct code is entered.
+- On connect (after notifications enable), while locked, emits `DATA:LINK:need` once; also
+  re-emits `DATA:LINK:need` whenever any non-link CMD arrives while locked.
+- STATUS JSON carries `"link":"required"` while locked, `"link":"ok"` once linked.
+- `CMD:link:<code>` → match: `linked`, emits `DATA:LINK:ok`, all CMDs accepted this session.
+  No match: emits `DATA:LINK:bad`, stays locked; after 5 bad tries a 5 s backoff (bad tries
+  during backoff just get `DATA:LINK:bad`).
+- Linking is **per BLE session** — resets to locked on disconnect/reboot. The code only
+  changes on reboot or an **encoder-button** press (regenerate + relock), so the app can
+  persist the last code per device and auto-resend `CMD:link:<code>` on reconnect to link
+  silently.
+
+New link records: `DATA:LINK:need`, `DATA:LINK:ok`, `DATA:LINK:bad`. STATUS field: `link`.
+
 ## Commands (CMD characteristic)
 | Command | Effect |
 |---|---|
+| `CMD:link:<code>` | pairing gate — unlock the session with the 6-digit code shown on screen |
 | `CMD:scan` / `CMD:sniff` / `CMD:aplist` | 2.4 GHz AP sweep → `DATA:AP:` (core wardrive feed) |
 | `CMD:stationlist` / `CMD:sniffsta` | promiscuous station sniff → `DATA:STA:` |
 | `CMD:probesniff` | promiscuous probe sniff → `DATA:PROBE:` |

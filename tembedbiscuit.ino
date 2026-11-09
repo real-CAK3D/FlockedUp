@@ -108,6 +108,23 @@ bool  nfcok = false;
 bool  irRxOn = false;
 String op = "idle";
 
+// ---- link-code pairing gate ------------------------------------------------
+// At boot we show a random 6-digit code on the screen. A BLE central may connect
+// and enable notifications, but until it sends CMD:link:<matching code> the device
+// is LOCKED and ignores every other CMD. Linking is per BLE session (resets on
+// disconnect); the code only changes on reboot or an encoder-button regenerate,
+// so the app can persist it per device and auto-resend on reconnect.
+uint32_t linkCode = 0;              // current 6-digit code (100000..999999)
+bool     linked = false;           // this BLE session has linked
+bool     linkNeedPending = false;  // owe the central a DATA:LINK:need
+uint32_t linkNeedAt = 0;           // when to send it (grace for CCCD enable)
+int      linkBadTries = 0;
+uint32_t linkBackoffUntil = 0;
+
+void genLinkCode() {
+  linkCode = 100000 + (esp_random() % 900000);  // always 6 digits, no leading zero
+}
+
 // Sub-GHz TX request handed from BLE callback to loop().
 volatile bool txPending = false;
 float  txFreq = 433.92f;
@@ -159,7 +176,9 @@ void setStatus(const char *o) {
   if (statChar) {
     String j = "{\"status\":0,\"battery\":100,\"op\":\"";
     j += o; j += "\",\"heap\":"; j += String(ESP.getFreeHeap());
-    j += ",\"model\":\"Biscuit-TEmbed\",\"name\":\"" DEV_NAME "\"}";
+    j += ",\"model\":\"Biscuit-TEmbed\",\"name\":\"" DEV_NAME "\",\"link\":\"";
+    j += (linked ? "ok" : "required");
+    j += "\"}";
     statChar->setValue((uint8_t *)j.c_str(), j.length());
   }
 }
@@ -194,6 +213,17 @@ void drawStatus(const String &l1, const String &l2) {
   tft.setTextSize(1);
   tft.setCursor(6, 36);  tft.setTextColor(ST77XX_CYAN);  tft.print(l1);
   tft.setCursor(6, 52);  tft.setTextColor(ST77XX_GREEN); tft.print(l2);
+  // Link code: big and clear while unlinked; "LINKED" once paired.
+  if (!linked) {
+    tft.setCursor(6, 84);  tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(1);
+    tft.print("LINK CODE");
+    tft.setCursor(6, 100); tft.setTextSize(3); tft.setTextColor(ST77XX_WHITE);
+    char cc[8]; sprintf(cc, "%06u", linkCode); tft.print(cc);
+  } else {
+    tft.setCursor(6, 92);  tft.setTextSize(3); tft.setTextColor(ST77XX_GREEN);
+    tft.print("LINKED");
+  }
+  tft.setTextSize(1);
   tft.setCursor(6, 150); tft.setTextColor(tft.color565(120, 120, 120));
   tft.print("svc 4fafc201  "); tft.print(DEV_NAME);
 }
@@ -586,6 +616,26 @@ void handleCommand(String v) {
   v.trim();
   if (!v.startsWith("CMD:")) return;
 
+  // ---- link-code pairing gate (runs before any other command) --------------
+  if (v.startsWith("CMD:link:")) {
+    String code = v.substring(9); code.trim();
+    if (linked) { notifyLine("DATA:LINK:ok\n"); return; }
+    if (linkBackoffUntil && millis() < linkBackoffUntil) { notifyLine("DATA:LINK:bad\n"); return; }
+    char want[8]; sprintf(want, "%06u", linkCode);
+    if (code == want) {
+      linked = true; linkNeedPending = false; linkBadTries = 0; linkBackoffUntil = 0;
+      notifyLine("DATA:LINK:ok\n");
+      setStatus(op.c_str());
+      drawStatus("BLE: linked", "op: idle");
+    } else {
+      if (++linkBadTries >= 5) { linkBackoffUntil = millis() + 5000; linkBadTries = 0; }  // short backoff
+      notifyLine("DATA:LINK:bad\n");
+    }
+    return;
+  }
+  // Locked: ignore every other CMD until linked, and (re)prompt the central.
+  if (!linked) { linkNeedPending = false; notifyLine("DATA:LINK:need\n"); return; }
+
   if (v.startsWith("CMD:stopscan"))      { stopAll(); notifyLine("DATA:MODE:idle,stop\n"); return; }
   if (v.startsWith("CMD:scanall"))       { subScan = true; setStatus("subghz"); setLed(8,4,0); notifyLine("DATA:MODE:subghz,start\n"); return; }
   if (v.startsWith("CMD:tx:")) {
@@ -620,9 +670,14 @@ class CmdCallbacks : public BLECharacteristicCallbacks {
 };
 
 class SrvCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *s) override { connected = true; setLed(0,0,16); drawStatus("BLE: connected", "op: idle"); }
+  void onConnect(BLEServer *s) override {
+    connected = true;
+    linked = false; linkNeedPending = true; linkNeedAt = millis() + 400;  // lock this session
+    setLed(16, 8, 0);                     // amber = connected but not linked
+    drawStatus("BLE: connected", "enter link code");
+  }
   void onDisconnect(BLEServer *s) override {
-    connected = false; stopAll();
+    connected = false; linked = false; stopAll();   // relock; code persists until reboot/regen
     drawStatus("BLE: advertising", "waiting for app");
     BLEDevice::startAdvertising();
   }
@@ -650,6 +705,8 @@ void setup() {
   pinMode(ENC_A, INPUT_PULLUP); pinMode(ENC_B, INPUT_PULLUP);
   pinMode(ENC_KEY, INPUT_PULLUP); pinMode(USER_KEY, INPUT_PULLUP);
   pinMode(CC1101_GDO0, INPUT);
+
+  genLinkCode();   // fresh 6-digit link code for this boot
 
   leds.begin(); leds.setBrightness(40); setLed(0, 0, 8);
 
@@ -700,6 +757,21 @@ void setup() {
 
 void loop() {
   pollSerialCommands();
+
+  // Link gate: prompt the central once notifications should be up; regenerate the
+  // code on an encoder-button press.
+  if (linkNeedPending && connected && !linked && millis() >= linkNeedAt) {
+    linkNeedPending = false;
+    notifyLine("DATA:LINK:need\n");
+  }
+  static uint32_t lastKey = 0;
+  if (digitalRead(ENC_KEY) == LOW && millis() - lastKey > 500) {
+    lastKey = millis();
+    genLinkCode(); linked = false;
+    drawStatus(connected ? "BLE: connected" : "BLE: advertising", "enter link code");
+    if (connected) notifyLine("DATA:LINK:need\n");
+  }
+
 #if ALLOW_TX
   if (txPending) { txPending = false; doTransmit(txFreq, txBits); }
 #endif
