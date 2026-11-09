@@ -22,6 +22,7 @@
 
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include "esp_system.h"   // esp_restart() for return-to-launcher
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -123,6 +124,20 @@ uint32_t linkBackoffUntil = 0;
 
 void genLinkCode() {
   linkCode = 100000 + (esp_random() % 900000);  // always 6 digits, no leading zero
+}
+
+// ---- return to bmorcelli's Launcher ----------------------------------------
+// This image is loaded by bmorcelli/Launcher, which lives in the loader app slot
+// and catches the Esc/back button (GPIO6 = USER_KEY, -DLAUNCHER_GPIO_KEYS {"Esc",6})
+// held during a restart. So the way back is simply: reboot while GPIO6 is held.
+// A long-press of USER_KEY does exactly that — because the user is still physically
+// holding the button through the reboot, the Launcher sees it and stays in the menu
+// instead of re-launching this app.
+void returnToLauncher() {
+  drawStatus("Returning to", "Launcher... hold Esc");
+  setLed(0, 0, 0);
+  delay(250);
+  esp_restart();
 }
 
 // Sub-GHz TX request handed from BLE callback to loop().
@@ -637,6 +652,12 @@ void handleCommand(String v) {
   if (!linked) { linkNeedPending = false; notifyLine("DATA:LINK:need\n"); return; }
 
   if (v.startsWith("CMD:stopscan"))      { stopAll(); notifyLine("DATA:MODE:idle,stop\n"); return; }
+  if (v.startsWith("CMD:launcher") || v.startsWith("CMD:reboot")) {
+    // Soft path: reboot. Reliable return to the Launcher needs GPIO6 held at boot,
+    // so prompt the user; the hardware long-press of USER_KEY is the guaranteed way.
+    notifyLine("DATA:MODE:launcher,reboot\n");
+    delay(60); returnToLauncher(); return;
+  }
   if (v.startsWith("CMD:scanall"))       { subScan = true; setStatus("subghz"); setLed(8,4,0); notifyLine("DATA:MODE:subghz,start\n"); return; }
   if (v.startsWith("CMD:tx:")) {
     String p = v.substring(7); int comma = p.indexOf(',');
@@ -771,6 +792,12 @@ void loop() {
     drawStatus(connected ? "BLE: connected" : "BLE: advertising", "enter link code");
     if (connected) notifyLine("DATA:LINK:need\n");
   }
+  // Hold the side/back button (USER_KEY = GPIO6) ~1.5s to return to the Launcher.
+  static uint32_t userKeyDownAt = 0;
+  if (digitalRead(USER_KEY) == LOW) {
+    if (userKeyDownAt == 0) userKeyDownAt = millis();
+    else if (millis() - userKeyDownAt > 1500) returnToLauncher();  // reboots while held
+  } else userKeyDownAt = 0;
 
 #if ALLOW_TX
   if (txPending) { txPending = false; doTransmit(txFreq, txBits); }

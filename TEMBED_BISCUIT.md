@@ -5,18 +5,46 @@ Plus (ESP32-S3) into a Biscuit board: Flying Flocks connects to it over BLE exac
 like any fleet board (service `4fafc201…`), and the same line protocol is mirrored over
 USB-CDC serial. Flashed to the board's **internal flash over USB** (not an SD image).
 
-## Build (BUILD ONLY — nothing flashed here)
-Flashable config (16 MB flash, huge_app partition) — **39% flash, 18% RAM**:
+## Build (BUILD ONLY — nothing flashed here) — Launcher-compatible
+This image is meant to be loaded by **bmorcelli's Launcher** on the T-Embed and coexist with
+the user's other firmwares (Bruce, Flipper, OTS, bboink). So it is **not** huge_app — it uses
+a modest dual-OTA app slot with a sketch-local `partitions.csv` and leaves SPIFFS/OTA room.
+
 ```
 arduino-cli compile \
-  --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=huge_app,PSRAM=opi" \
+  --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=custom,PSRAM=opi" \
   --warnings none \
   --build-property "compiler.c.elf.extra_flags=-Wl,--allow-multiple-definition" \
   G:/arduino-tools/sketches/tembedbiscuit
 ```
-(The default `esp32:esp32:esp32s3` also builds but fills 94% of the 1.3 MB app slot — use
-the 16 MB/huge_app FQBN for a real image.) The linker flag is needed because the firmware
-overrides `ieee80211_raw_frame_sanity_check` to allow crafted deauth/beacon frames.
+`PartitionScheme=custom` makes the core use the sketch's `partitions.csv` (below).
+The linker flag is needed because the firmware overrides `ieee80211_raw_frame_sanity_check`
+to allow crafted deauth/beacon frames.
+
+### Partition table (sketch `partitions.csv`, verified applied)
+```
+nvs       data nvs       0x009000 0x005000   (20K)   # offsets match Launcher's custom_16Mb.csv
+otadata   data ota       0x00E000 0x002000   (8K)
+app0      app  ota_0     0x010000 0x200000   (2048K) # Biscuit app binary = 1.19MB => ~60% used
+app1      app  ota_1     0x210000 0x200000   (2048K) # OTA room
+spiffs    data spiffs    0x410000 0xBE0000   (12160K)
+coredump  data coredump  0xFF0000 0x010000   (64K)
+```
+**App binary (`tembedbiscuit.ino.bin`, ~1.19 MB)** is what the Launcher installs into its app
+slot (non-merged app image, magic `0xE9`). `tembedbiscuit.ino.merged.bin` is only for flashing
+standalone over USB. bmorcelli's Launcher repartitions dynamically on install, so the on-device
+layout is ultimately the Launcher's; this table just keeps the binary modest with headroom and
+OTA-friendly rather than owning all 16 MB.
+
+### Returning to the Launcher
+The Launcher catches its Esc/back key (**GPIO6 = the T-Embed USER_KEY**, per the Launcher's
+`-DLAUNCHER_GPIO_KEYS='{{"Esc",6}}'`) held during a restart. This firmware uses that:
+- **Hold the side/USER button (GPIO6) ~1.5 s** → the firmware reboots *while you keep holding
+  it*, so the Launcher sees GPIO6 at boot and stays in its menu. (Shows "Returning to Launcher".)
+- `CMD:launcher` (or `CMD:reboot`) also reboots the board, but a plain reboot re-launches this
+  app unless GPIO6 is held — so the button hold is the guaranteed path; the command just emits
+  `DATA:MODE:launcher,reboot` and resets.
+Plain power-cycle + hold GPIO6 works too.
 
 ## GATT contract (unchanged — app filters on service UUID)
 Service `4fafc201-1fb5-459e-8fcc-c5c9c331914b`; CMD `…b26a8` (Write/WriteNR),
@@ -56,6 +84,7 @@ New link records: `DATA:LINK:need`, `DATA:LINK:ok`, `DATA:LINK:bad`. STATUS fiel
 | `CMD:nfcread` | poll PN532 for a tag → `DATA:NFC:` |
 | `CMD:irsend:<proto>,<hex>[,<bits>]` | IR transmit (NEC/SONY/SAMSUNG/RC5) → `DATA:IRTX:` |
 | `CMD:irsniff` | enable IR receiver → `DATA:IR:` on capture |
+| `CMD:launcher` / `CMD:reboot` | reboot → `DATA:MODE:launcher,reboot` (hold GPIO6 to land in the Launcher) |
 | `CMD:stopscan` | stop everything → `DATA:MODE:idle,stop` |
 
 ## DATA records (RESPONSE notify + USB serial)

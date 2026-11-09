@@ -1,0 +1,12 @@
+# Launcher-friendly 16MB layout for the T-Embed CC1101 Biscuit image.
+# NOT huge_app: a modest 2MB dual-OTA app slot (the 1.25MB Biscuit binary sits ~62%,
+# "room to breathe") plus big SPIFFS, so it coexists with bmorcelli's Launcher and the
+# other firmwares instead of owning all of flash. nvs/otadata offsets match Launcher's
+# custom_16Mb.csv so the app doesn't collide with the loader's metadata.
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x5000
+otadata,    data, ota,     0xE000,   0x2000
+app0,       app,  ota_0,   0x10000,  0x200000
+app1,       app,  ota_1,   0x210000, 0x200000
+spiffs,     data, spiffs,  0x410000, 0xBE0000
+coredump,   data, coredump,0xFF0000, 0x10000
