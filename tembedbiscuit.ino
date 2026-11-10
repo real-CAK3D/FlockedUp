@@ -49,7 +49,7 @@
 
 // Declared up here (before the first function) so Arduino's auto-generated
 // prototypes, which reference it, see the type.
-enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_FILE, S_SET, S_ABOUT, S_ACTION, S_CONFIRM };
+enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_COLL, S_FILE, S_SET, S_ABOUT, S_ACTION, S_CONFIRM };
 
 // ---- Biscuit GATT contract (matches the app's BiscuitGatt, verified) --------
 #define SVC_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -222,10 +222,12 @@ uint32_t fuLastInput = 0;           // for the auto-sleep timeout
 const uint32_t SLEEP_OPTS[] = {0, 1, 2, 5, 10};
 const int      SLEEP_OPTS_N = 5;
 
-const char* MAIN_PLAIN[] = {"Sub-GHz","NFC / RFID","Infrared","Wi-Fi Recon","Bluetooth","SD Files","Settings","About"};
-const char* MAIN_PUN[]   = {"Caw-GHz","Peck","Flock Beam","Murder Scan","Scavenge","The Nest","Roost","The Murder"};
-const FUScreen MAIN_GOTO[] = {S_SUB,S_NFC,S_IR,S_WIFI,S_BLE,S_NEST,S_SET,S_ABOUT};
-const int   MAIN_N = 8;
+const char* MAIN_PLAIN[] = {"Sub-GHz","NFC / RFID","Infrared","Wi-Fi Recon","Bluetooth","SD Files","Collections","Settings","About"};
+const char* MAIN_PUN[]   = {"Caw-GHz","Peck","Flock Beam","Murder Scan","Scavenge","The Nest","Hoard","Roost","The Murder"};
+const FUScreen MAIN_GOTO[] = {S_SUB,S_NFC,S_IR,S_WIFI,S_BLE,S_NEST,S_COLL,S_SET,S_ABOUT};
+const int   MAIN_N = 9;
+#define COLL_ROOT "/flockedup/collections"
+String nestFloor = "/";   // the root this Nest session is anchored to (back stops here)
 const char* SUB_ITEMS[]  = {"Scan & Decode","RSSI Sweep","Analyzer"};
 const int   SUB_N = 3;
 const char* WIFI_ITEMS[] = {"AP Scan","Stations","Probes","Pkt Monitor","Deauth","Beacon Spam"};
@@ -961,6 +963,7 @@ void saveCfg() {
 }
 
 // --- crow mascot: embedded pixel sprite drawn in purple, centered at (cx,cy) --
+static uint16_t crowBuf[120 * 100];
 void drawCrow(int cx, int cy, uint8_t mood) {
   const uint8_t *bmp; int w, h;
   switch (mood) {
@@ -969,7 +972,14 @@ void drawCrow(int cx, int cy, uint8_t mood) {
     case 3:  bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; break;
     default: bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; break;
   }
-  tft.drawBitmap(cx - w / 2, cy - h / 2, bmp, w, h, C_PLUM);
+  // Expand the 1-bit mask to RGB565 and blit the whole block in one windowed
+  // transaction (drawRGBBitmap) — far faster than per-pixel drawBitmap.
+  if (w > 120 || h > 100) { tft.drawBitmap(cx - w / 2, cy - h / 2, bmp, w, h, C_PLUM); return; }
+  int rb = (w + 7) / 8;
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++)
+      crowBuf[y * w + x] = (pgm_read_byte(&bmp[y * rb + x / 8]) & (0x80 >> (x % 8))) ? C_PLUM : C_BG;
+  tft.drawRGBBitmap(cx - w / 2, cy - h / 2, crowBuf, w, h);
 }
 
 void fuHeader(const char* title) {
@@ -983,12 +993,12 @@ void fuHeader(const char* title) {
 void fuDrawList(const char* title, const char* const* plain, const char* const* pun, int n, int sel) {
   if (fuFull) { tft.fillScreen(C_BG); fuHeader(title); drawCrow(58, 92, fuMood); }
   else        { tft.fillRect(112, 18, 208, 152, C_BG); }
-  int x = 120, y = 22;
+  int x = 120, y = 20;
   for (int i = 0; i < n; i++) {
     const char* lbl = (cfg.puns && pun) ? pun[i] : plain[i];
-    if (i == sel) { tft.fillRoundRect(x-6, y-3, 200, 16, 4, C_PANEL); tft.drawRoundRect(x-6, y-3, 200, 16, 4, C_BLOOD); }
-    tft.setTextColor(i == sel ? C_INK : C_DIM); tft.setTextSize(1); tft.setCursor(x, y+1); tft.print(lbl);
-    y += 18;
+    if (i == sel) { tft.fillRoundRect(x-6, y-2, 200, 14, 3, C_PANEL); tft.drawRoundRect(x-6, y-2, 200, 14, 3, C_BLOOD); }
+    tft.setTextColor(i == sel ? C_INK : C_DIM); tft.setTextSize(1); tft.setCursor(x, y); tft.print(lbl);
+    y += 16;
   }
 }
 
@@ -1057,7 +1067,7 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.5");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.6");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
@@ -1178,9 +1188,10 @@ void fuNestSelect() {
 void fuBack() {
   if (fuScr == S_ACTION) { fuStopAction(); fuScr = fuActionParent; fuDirty = true; return; }
   if (fuScr == S_FILE)   { fuScr = S_NEST; fuDirty = true; return; }
-  if (fuScr == S_NEST && nestPath != "/" && nestPath.length() > 1) {
+  if (fuScr == S_NEST && nestPath != nestFloor) {
     int sl = nestPath.lastIndexOf('/'); String up = (sl <= 0) ? "/" : nestPath.substring(0, sl);
-    if (up.length() == 0) up = "/"; nestLoad(up); fuDirty = true; return;
+    if (up.length() < nestFloor.length()) up = nestFloor;
+    nestLoad(up); fuDirty = true; return;
   }
   if (fuScr == S_CONFIRM) { fuScr = S_WIFI; fuDirty = true; return; }
   if (fuScr == S_MAIN) return;
@@ -1264,7 +1275,8 @@ void fuHandleInput() {
     fuLastInput = millis();
     switch (fuScr) {
       case S_MAIN:
-        if (MAIN_GOTO[fuSel] == S_NEST) { fuScr = S_NEST; nestLoad("/"); fuSel = 0; fuDirty = true; }
+        if (MAIN_GOTO[fuSel] == S_NEST) { nestFloor = "/"; fuScr = S_NEST; nestLoad("/"); fuSel = 0; fuDirty = true; }
+        else if (MAIN_GOTO[fuSel] == S_COLL) { SD.mkdir("/flockedup"); SD.mkdir(COLL_ROOT); nestFloor = COLL_ROOT; fuScr = S_NEST; nestLoad(COLL_ROOT); fuSel = 0; fuDirty = true; }
         else fuEnter(MAIN_GOTO[fuSel]);
         break;
       case S_SUB:  fuActionParent = S_SUB; fuStartAction(S_SUB, fuSel); break;
@@ -1304,7 +1316,7 @@ void setup() {
   pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
   tft.init(170, 320);
   tft.setRotation(cfg.rot);        // landscape 320x170 (1 normal / 3 flipped)
-  tft.setSPISpeed(40000000);       // 40 MHz display clock — fast redraws
+  tft.setSPISpeed(80000000);       // 80 MHz display clock — fast redraws
   sdok = SD.begin(SD_CS, SPI, 10000000);
   Serial.println(sdok ? "[sd] mounted." : "[sd] no card.");
   fuBootSplash();
