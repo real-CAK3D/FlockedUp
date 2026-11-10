@@ -211,6 +211,7 @@ volatile bool localActive = false; // a local job wants the radios to run (no ho
 bool    nfcPolling = false;
 volatile bool bleScanRun = false;
 volatile bool anaRun = false;        // frequency-analyzer sweep active
+volatile bool wfRun  = false;        // 433 MHz spectrum/waterfall sweep active
 BLEScan *pBLEScan = nullptr;
 
 FUScreen fuScr = S_BOOT;
@@ -245,8 +246,8 @@ int      stashN = 0, stashTop = 0;
 uint8_t  fuConfirmKind = 0;          // 0 = Wi-Fi offensive, 1 = run .fu, 2 = play .sub, 3 = play .ir
 String   fuPendingPath = "";
 FUScreen fuConfirmReturn = S_WIFI;   // where Back/Cancel from the confirm screen goes
-const char* SUB_ITEMS[]  = {"Scan & Decode","RSSI Sweep","Analyzer"};
-const int   SUB_N = 3;
+const char* SUB_ITEMS[]  = {"Scan & Decode","RSSI Sweep","Analyzer","Waterfall"};
+const int   SUB_N = 4;
 const char* WIFI_ITEMS[] = {"AP Scan","Stations","Probes","Pkt Monitor","Deauth","Beacon Spam"};
 const int   WIFI_N = 6;
 
@@ -311,13 +312,36 @@ void notifyLine(const String &line) {
 void setStatus(const char *o) {
   op = o;
   if (statChar) {
+    // Richer per-board health so the app can tell whether a board is working:
+    // live heap (memory-leak/health), uptime (crash/reboot detection), and the
+    // state of each radio/peripheral (sd/cc1101/nfc) plus the link gate.
     String j = "{\"status\":0,\"battery\":100,\"op\":\"";
     j += o; j += "\",\"heap\":"; j += String(ESP.getFreeHeap());
+    j += ",\"uptime\":"; j += String(millis() / 1000);
+    j += ",\"sd\":"; j += (sdok ? 1 : 0);
+    j += ",\"cc1101\":"; j += (cc1101ok ? 1 : 0);
+    j += ",\"nfc\":"; j += (nfcok ? 1 : 0);
     j += ",\"model\":\"LilyGo T-Embed CC1101 Plus\",\"name\":\"" DEV_NAME "\",\"link\":\"";
     j += (linked ? "ok" : "required");
     j += "\"}";
     statChar->setValue((uint8_t *)j.c_str(), j.length());
   }
+}
+
+// Live health heartbeat. Streams the same per-board telemetry as a DATA line so
+// it flows over BLE *and* USB-CDC through the normal pipeline (no new GATT): the
+// app parses it into the Fleet Health view, and it's readable on a USB terminal.
+//   DATA:HEALTH:<heapFree>,<uptimeSec>,<sd>,<cc1101>,<nfc>,<link>
+void emitHealth() {
+  String h = "DATA:HEALTH:";
+  h += String(ESP.getFreeHeap()); h += ",";
+  h += String(millis() / 1000);  h += ",";
+  h += (sdok ? "1" : "0");       h += ",";
+  h += (cc1101ok ? "1" : "0");   h += ",";
+  h += (nfcok ? "1" : "0");      h += ",";
+  h += (linked ? "ok" : (connected ? "wait" : "off"));
+  h += "\n";
+  notifyLine(h);
 }
 
 const char *authStr(wifi_auth_mode_t a) {
@@ -441,6 +465,34 @@ void freqAnalyzer() {
   ledSignal(bestR);
   notifyLine("peak " + String(bestF, 2) + " MHz  " + String(bestR) + " dBm\n");
   setRfBand(bestF); ELECHOUSE_cc1101.setMHZ(bestF); ELECHOUSE_cc1101.SetRx();  // park on the peak
+}
+
+// 433 MHz spectrum "waterfall": fine-sweep the 433 ISM band and stream one
+// compact spectrum line per pass (app renders the running waterfall; the device
+// shows the live peak + LED). DATA:SPECTRUM:<f0>,<stepMHz>,<nBins>,<r0;r1;...>
+void waterfall() {
+  if (!cc1101ok) { cc1101ok = initCC1101(); if (!cc1101ok) return; }
+  ELECHOUSE_cc1101.setCCMode(1);
+  ELECHOUSE_cc1101.setModulation(0);
+  const float F0 = 433.0f, STEP = 0.05f;
+  const int   N  = 40;                 // 433.00 .. 434.95 MHz
+  setRfBand(F0);
+  float bestF = F0; int bestR = -128;
+  String csv; csv.reserve(220);
+  for (int i = 0; i < N && wfRun; i++) {
+    float f = F0 + STEP * i;
+    ELECHOUSE_cc1101.setMHZ(f);
+    ELECHOUSE_cc1101.SetRx();
+    delayMicroseconds(900);
+    int r = ELECHOUSE_cc1101.getRssi();
+    if (r > bestR) { bestR = r; bestF = f; }
+    if (i) csv += ";";
+    csv += String(r);
+  }
+  if (!wfRun) return;
+  ledSignal(bestR);
+  notifyLine("DATA:SPECTRUM:" + String(F0, 2) + "," + String(STEP, 2) + "," + String(N) + "," + csv + "\n");
+  notifyLine("peak " + String(bestF, 2) + " MHz  " + String(bestR) + " dBm\n");
 }
 
 static const uint32_t GAP_US = 5000;
@@ -831,7 +883,7 @@ void runBleScanPass() {
 void stopAll() {
   scanning = false; subScan = false;
   deauthRun = false; beaconRun = false;
-  bleScanRun = false; anaRun = false;
+  bleScanRun = false; anaRun = false; wfRun = false;
   stopSniffer();
   setStatus("idle");
   setLed(0, 0, 8);
@@ -1248,10 +1300,13 @@ static const uint8_t BIRD9[] PROGMEM = { 0x80,0x80, 0x63,0x00, 0x3E,0x00, 0x1C,0
 
 // Compose background + the current animation frame of the crow and blit once.
 void drawCrowPanel(uint8_t mood, uint32_t ms) {
-  const uint8_t *bmp; int w, h; int dy = 0;
+  const uint8_t *bmp; int w, h; int dy = 0, dx = 0;
   uint32_t ph = ms / 90;                       // ~11 logical fps
+  static const int8_t BOB[8]  = {0, -1, -2, -2, -1, 0, 0, 1};   // breathing bob
+  static const int8_t SWAY[8] = {0, 1, 2, 2, 1, 0, -1, -2};     // lazy side-to-side
   switch (mood) {
-    case 1:  // scan — wing flap + quick bob
+    case 1:  // scan — alert head + wing flap, sweeping side to side
+      dx = SWAY[(ms / 140) & 7];
       if (ph & 1) { bmp = CROW_SCAN; w = CROW_SCAN_W; h = CROW_SCAN_H; dy = -2; }
       else        { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
       break;
@@ -1259,19 +1314,26 @@ void drawCrowPanel(uint8_t mood, uint32_t ms) {
       bmp = CROW_HIT; w = CROW_HIT_W; h = CROW_HIT_H;
       dy = (ph % 4 < 2) ? -3 : 0;
       break;
-    case 3:  // flip — flipping off, wing alternating
+    case 3:  // flip — flipping off, wing alternating fast
       if (ph & 1) { bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; dy = -1; }
       else        { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
       break;
-    default: { // idle — gentle breathing bob + a wing-flap every ~5s
-      static const int8_t BOB[8] = {0, -1, -2, -2, -1, 0, 0, 1};
+    default: { // idle — a living 8s loop: breathe + sway, glance twice, double-flap
+      uint32_t t = ms % 8000;
       dy = BOB[ph & 7];
-      if ((ms % 5000) < 180) { bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; dy -= 1; }
-      else                   { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
+      dx = SWAY[(ms / 220) & 7];
+      if (t < 300 || (t >= 3000 && t < 3280)) {        // two quick glances
+        bmp = CROW_SCAN; w = CROW_SCAN_W; h = CROW_SCAN_H; dy -= 1;
+      } else if (t >= 6000 && t < 6500) {              // a little double wing-flap
+        if (ph & 1) { bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; dy -= 2; }
+        else        { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
+      } else {
+        bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H;
+      }
     } break;
   }
   for (int i = 0; i < CROW_PW * CROW_PH; i++) crowBuf[i] = C_BG;
-  int ox = (58 - CROW_PX) - w / 2;
+  int ox = (58 - CROW_PX) - w / 2 + dx;
   int oy = (92 - CROW_PY) - h / 2 + dy;
   int rb = (w + 7) / 8;
   for (int y = 0; y < h; y++) {
@@ -1475,7 +1537,7 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.8");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.9");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
@@ -1556,6 +1618,7 @@ void fuStartAction(FUScreen from, int idx) {
   uiActionActive = true; localActive = true; nfcPolling = false; fuMood = 1;
   if (from == S_SUB) {
     if (idx == 2) { fuActionTitle = "Analyzer"; anaRun = true; setStatus("analyze"); }
+    else if (idx == 3) { fuActionTitle = "Waterfall"; wfRun = true; setStatus("waterfall"); setLed(6, 0, 10); }
     else { fuActionTitle = (idx == 0) ? "Sub-GHz decode" : "RSSI sweep"; subScan = true; setStatus("subghz"); setLed(8, 4, 0); }
   } else if (from == S_NFC) {
     fuActionTitle = "NFC read"; nfcPolling = true; setStatus("nfc"); setLed(0, 8, 8);
@@ -1896,6 +1959,8 @@ void loop() {
     runBleScanPass();
   } else if (host && anaRun) {
     freqAnalyzer(); delay(120);
+  } else if (host && wfRun) {
+    waterfall(); delay(80);
   } else {
     delay(16);
   }
@@ -1915,4 +1980,11 @@ void loop() {
 
   static uint32_t lastStat = 0;
   if (millis() - lastStat > 2000) { lastStat = millis(); setStatus(op.c_str()); }
+
+  // Live health heartbeat to any listener (phone over BLE, PC/phone over USB).
+  static uint32_t lastHealth = 0;
+  if ((connected || serialActive) && millis() - lastHealth > 3000) {
+    lastHealth = millis();
+    emitHealth();
+  }
 }

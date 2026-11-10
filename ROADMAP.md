@@ -7,7 +7,7 @@ Feature backlog for the crow-themed T-Embed CC1101 Plus firmware.
 ## Sub-GHz / RF (CC1101: 300–348, 387–464, 779–928 MHz)
 - ✅ Free-tune frequency (encoder-dial any freq in band)
 - ✅ Frequency Analyzer — find the active frequency of a remote **(v0.5)**
-- ✅ Full-band waterfall / spectrum view
+- ✅ 433 MHz spectrum / waterfall (streams DATA:SPECTRUM, LED peak meter) **(v0.9)** — full-band waterfall next
 - ✅ RSSI "fox-hunt" meter (hot/cold signal finder)
 - ✅ More decoders: CAME, NICE, Holtek, Princeton; more TPMS (Toyota/Ford/Schrader); more weather (Acurite/Oregon/LaCrosse/Ambient)
 - ✅ Record → SD (.sub) → replay (gated); browse the 20k-file library in The Nest
@@ -50,6 +50,7 @@ Feature backlog for the crow-themed T-Embed CC1101 Plus firmware.
 - ✅ More scenes + per-screen contextual crows
 - ✅ Animated crow — fluid pixel loop (idle breathing bob + wing-flap, scan flap, hit hop, flip) **(v0.8)**
 - ✅ Screen border + 3-crow corner accent **(v0.8)**
+- ✅ Deeper idle loop — two glances + a double wing-flap + lazy side-to-side sway **(v0.9)**
 - ⬜ Multi-frame hand-drawn sequences (drop more crow frames to deepen each loop)
 - ✅ Theme accent colors; LED shows (signal meter **(v0.5)**, pulse, rainbow)
 - ✅ Screensaver; day/night auto-theme
@@ -59,6 +60,12 @@ Feature backlog for the crow-themed T-Embed CC1101 Plus firmware.
 - ✅ Battery %; units (°C/°F, metric/imperial)
 - 🌐 Saved Wi-Fi networks; clock/timezone
 - ✅ Data logging to SD (+GPS); setting profiles; diagnostics; factory reset; favorites
+
+## Fleet telemetry & health
+- ✅ Live health heartbeat — `DATA:HEALTH:<heap>,<uptime>,<sd>,<cc1101>,<nfc>,<link>` every ~3s over BLE **and** USB-CDC **(v0.9)**
+- ✅ Richer STATUS JSON (uptime + per-radio up/down) so the app's Fleet Health view can tell a board is working **(v0.9)**
+- 📱 Triangulation: same signal heard by ≥2 boards → strongest board is closest (app-side, from the relay log) **(v0.9)**
+- 🔌 Per-board battery % (needs the board's BAT ADC pin confirmed)
 
 ## Mesh / fleet
 - 📱 Mesh messages on-screen (relayed from the XIAO Meshtastic node via the app — CC1101 can't do LoRa)
@@ -76,4 +83,4 @@ Feature backlog for the crow-themed T-Embed CC1101 Plus firmware.
 - ⛔ Jam/flood/noise — refused in the engine (federal offence, no own-network exception)
 
 ---
-Shipped: v0.1 crow UI · v0.2 BLE scan + OOK decode · v0.3 pixel-art mascot · v0.4 rotation/speed/sleep/settings · v0.5 Frequency Analyzer + LED signal meter · v0.6 Collections (Hoard) + 80 MHz UI · v0.7 Scripts engine, capture replay, importer, on-device move · **v0.8 fluid animated crow + screen border + 3-crow accent**
+Shipped: v0.1 crow UI · v0.2 BLE scan + OOK decode · v0.3 pixel-art mascot · v0.4 rotation/speed/sleep/settings · v0.5 Frequency Analyzer + LED signal meter · v0.6 Collections (Hoard) + 80 MHz UI · v0.7 Scripts engine, capture replay, importer, on-device move · v0.8 fluid animated crow + screen border + 3-crow accent · **v0.9 live health heartbeat + 433 waterfall + deeper crow loop**
