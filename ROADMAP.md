@@ -65,5 +65,13 @@ Feature backlog for the crow-themed T-Embed CC1101 Plus firmware.
 ## Add-on modules
 - 🔌 NRF24 (2.4 GHz scan/analysis) · external GPS (UART) · BME280 (I²C weather) · LoRa (real Meshtastic)
 
+## Scripts & automation (.fu "Tricks")
+- ✅ On-device `.fu` macro engine: `caw` `wait` `led` `nfc` `ir` `irfile` `sub` `tx` (TX verbs gated by the Authorize screen)
+- ✅ Native capture replay: Flipper RAW `.sub` over CC1101, parsed/raw `.ir` over the IR LED
+- ✅ Importer: drop `.sub`/`.ir`/`.fu` into `/flockedup/import` → wrapped into runnable Scripts
+- ✅ On-device move: copy any capture in The Nest into a stash (collection), new or existing
+- ✅📱 Phone can `CMD:import` / `CMD:scriptlist` / `CMD:script:run:<name>`
+- ⛔ Jam/flood/noise — refused in the engine (federal offence, no own-network exception)
+
 ---
-Shipped: v0.1 crow UI · v0.2 BLE scan + OOK decode · v0.3 pixel-art mascot · v0.4 rotation/speed/sleep/settings · **v0.5 Frequency Analyzer + LED signal meter**
+Shipped: v0.1 crow UI · v0.2 BLE scan + OOK decode · v0.3 pixel-art mascot · v0.4 rotation/speed/sleep/settings · v0.5 Frequency Analyzer + LED signal meter · v0.6 Collections (Hoard) + 80 MHz UI · **v0.7 Scripts engine, capture replay, importer, on-device move**

@@ -49,7 +49,7 @@
 
 // Declared up here (before the first function) so Arduino's auto-generated
 // prototypes, which reference it, see the type.
-enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_COLL, S_FILE, S_SET, S_ABOUT, S_ACTION, S_CONFIRM };
+enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_COLL, S_FILE, S_FILEMENU, S_STASH, S_SCRIPT, S_SET, S_ABOUT, S_ACTION, S_CONFIRM };
 
 // ---- Biscuit GATT contract (matches the app's BiscuitGatt, verified) --------
 #define SVC_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -157,6 +157,12 @@ volatile bool txPending = false;
 float  txFreq = 433.92f;
 String txBits = "";
 
+// Deferred script-engine requests from BLE/serial (run in loop(), not the cb).
+volatile bool importPending = false;
+volatile bool listPending = false;
+volatile bool scriptRunPending = false;
+String        scriptRunPath = "";
+
 bool serialActive = false;
 
 // ===========================================================================
@@ -222,12 +228,23 @@ uint32_t fuLastInput = 0;           // for the auto-sleep timeout
 const uint32_t SLEEP_OPTS[] = {0, 1, 2, 5, 10};
 const int      SLEEP_OPTS_N = 5;
 
-const char* MAIN_PLAIN[] = {"Sub-GHz","NFC / RFID","Infrared","Wi-Fi Recon","Bluetooth","SD Files","Collections","Settings","About"};
-const char* MAIN_PUN[]   = {"Caw-GHz","Peck","Flock Beam","Murder Scan","Scavenge","The Nest","Hoard","Roost","The Murder"};
-const FUScreen MAIN_GOTO[] = {S_SUB,S_NFC,S_IR,S_WIFI,S_BLE,S_NEST,S_COLL,S_SET,S_ABOUT};
-const int   MAIN_N = 9;
-#define COLL_ROOT "/flockedup/collections"
+const char* MAIN_PLAIN[] = {"Sub-GHz","NFC / RFID","Infrared","Wi-Fi Recon","Bluetooth","SD Files","Collections","Scripts","Settings","About"};
+const char* MAIN_PUN[]   = {"Caw-GHz","Peck","Flock Beam","Murder Scan","Scavenge","The Nest","Hoard","Tricks","Roost","The Murder"};
+const FUScreen MAIN_GOTO[] = {S_SUB,S_NFC,S_IR,S_WIFI,S_BLE,S_NEST,S_COLL,S_SCRIPT,S_SET,S_ABOUT};
+const int   MAIN_N = 10;
+#define COLL_ROOT   "/flockedup/collections"
+#define SCRIPT_ROOT "/flockedup/scripts"
+#define IMPORT_ROOT "/flockedup/import"
 String nestFloor = "/";   // the root this Nest session is anchored to (back stops here)
+
+// --- Scripts / stash / local-TX confirm state (Flocked Up "Tricks") ----------
+String   scriptNames[96];
+int      scriptN = 0;
+String   stashNames[96];
+int      stashN = 0, stashTop = 0;
+uint8_t  fuConfirmKind = 0;          // 0 = Wi-Fi offensive, 1 = run .fu, 2 = play .sub, 3 = play .ir
+String   fuPendingPath = "";
+FUScreen fuConfirmReturn = S_WIFI;   // where Back/Cancel from the confirm screen goes
 const char* SUB_ITEMS[]  = {"Scan & Decode","RSSI Sweep","Analyzer"};
 const int   SUB_N = 3;
 const char* WIFI_ITEMS[] = {"AP Scan","Stations","Probes","Pkt Monitor","Deauth","Beacon Spam"};
@@ -873,6 +890,11 @@ void handleCommand(String v) {
   if (v.startsWith("CMD:irsniff"))      { irRxOn = true; irrecv.enableIRIn(); notifyLine("DATA:MODE:irsniff,start\n"); return; }
   if (v.startsWith("CMD:blescan") || v.startsWith("CMD:btscan") || v.startsWith("CMD:sniffbt")) { bleScanRun = true; setStatus("ble"); setLed(0,0,12); notifyLine("DATA:MODE:bt,start\n"); return; }
 
+  // ---- Flocked Up script engine (Tricks), driven from the phone --------------
+  if (v.startsWith("CMD:import"))      { importPending = true; notifyLine("DATA:MODE:import,start\n"); return; }
+  if (v.startsWith("CMD:scriptlist") || v.startsWith("CMD:script:list")) { listPending = true; return; }
+  if (v.startsWith("CMD:script:run:")) { scriptRunPath = v.substring(15); scriptRunPath.trim(); scriptRunPending = true; notifyLine("DATA:MODE:script,start\n"); return; }
+
   // Generic wardrive sweep (main DATA:AP feed).
   if (v.startsWith("CMD:scan") || v.startsWith("CMD:sniff") || v.startsWith("CMD:aplist")) {
     subScan=false; stopSniffer(); scanning = true; setStatus("wardrive"); setLed(0,10,0); return;
@@ -906,6 +928,250 @@ void pollSerialCommands() {
       if (sbuf.length()) { String l = sbuf; sbuf = ""; l.trim(); if (l.startsWith("CMD:")) { serialActive = true; handleCommand(l); } }
     } else if (sbuf.length() < 160) sbuf += ch; else sbuf = "";
   }
+}
+
+// ===========================================================================
+// FLOCKED UP — capture replay + .fu script engine + on-device importer
+//
+// All of this is STANDALONE (no app needed). TX paths (sub/ir/tx) are the
+// same OOK/IR replay the Biscuit bridge already gates — meant for your OWN
+// gear and routed through the on-screen "Authorize / this TRANSMITS" confirm.
+// There is deliberately NO jam/flood/noise primitive: operating an RF jammer
+// is a federal offence with no personal-property exception, so the engine
+// refuses those verbs instead of running them.
+// ===========================================================================
+
+// Stream-copy a file into dstDir (creates the dir, overwrites a same-named file).
+bool fuCopyFile(const String &src, const String &dstDir) {
+  if (!sdok) return false;
+  SD.mkdir("/flockedup"); SD.mkdir(dstDir);
+  String base = src; int sl = base.lastIndexOf('/'); if (sl >= 0) base = base.substring(sl + 1);
+  String dst = dstDir; if (!dst.endsWith("/")) dst += "/"; dst += base;
+  if (SD.exists(dst)) SD.remove(dst);
+  File in = SD.open(src, FILE_READ);  if (!in) return false;
+  File out = SD.open(dst, FILE_WRITE); if (!out) { in.close(); return false; }
+  uint8_t buf[512]; int n;
+  while ((n = in.read(buf, sizeof(buf))) > 0) out.write(buf, n);
+  out.close(); in.close();
+  return true;
+}
+
+// Replay a Flipper SubGHz RAW .sub capture over the CC1101 (OOK, gated).
+// Reads Frequency: + RAW_Data: timing lists (+ = carrier on, - = off, in us).
+void playSub(const String &path) {
+#if ALLOW_TX
+  File f = SD.open(path, FILE_READ);
+  if (!f) { notifyLine("DATA:ERR:sub,open\n"); return; }
+  if (!cc1101ok) { cc1101ok = initCC1101(); if (!cc1101ok) { f.close(); notifyLine("DATA:ERR:sub,noradio\n"); return; } }
+  detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+  float mhz = 433.92f; bool isRaw = false, armed = false; long edges = 0;
+  notifyLine("sub " + path.substring(path.lastIndexOf('/') + 1) + "\n");
+  while (f.available()) {
+    String ln = f.readStringUntil('\n'); ln.trim();
+    if (ln.startsWith("Frequency:"))      { mhz = ln.substring(10).toFloat() / 1000000.0f; }
+    else if (ln.startsWith("Protocol:"))  { if (ln.indexOf("RAW") >= 0) isRaw = true; }
+    else if (ln.startsWith("RAW_Data:") && isRaw) {
+      if (!armed) {
+        setRfBand(mhz);
+        ELECHOUSE_cc1101.setCCMode(0); ELECHOUSE_cc1101.setModulation(2);
+        ELECHOUSE_cc1101.setMHZ(mhz); ELECHOUSE_cc1101.SetTx();
+        pinMode(CC1101_GDO0, OUTPUT); armed = true;
+      }
+      String d = ln.substring(9); int i = 0, L = d.length();
+      while (i < L) {
+        while (i < L && d[i] == ' ') i++;
+        int sign = 1; if (i < L && (d[i] == '-' || d[i] == '+')) { if (d[i] == '-') sign = -1; i++; }
+        long v = 0; bool any = false;
+        while (i < L && d[i] >= '0' && d[i] <= '9') { v = v * 10 + (d[i] - '0'); i++; any = true; }
+        if (!any) break;
+        long us = sign * v;
+        digitalWrite(CC1101_GDO0, us > 0 ? HIGH : LOW);
+        long a = us > 0 ? us : -us; if (a > 100000) a = 100000;
+        if (a > 16000) delay(a / 1000); else delayMicroseconds((unsigned)a);
+        edges++;
+      }
+    }
+  }
+  f.close();
+  if (armed) { digitalWrite(CC1101_GDO0, LOW); ELECHOUSE_cc1101.SetRx(); pinMode(CC1101_GDO0, INPUT); }
+  if (!isRaw) notifyLine("keyed .sub not supported\n");
+  else        notifyLine("DATA:SUBDONE:" + String(edges) + "\n");
+#else
+  notifyLine("DATA:ERR:tx,disabled\n");
+#endif
+}
+
+// Replay a Flipper .ir file. Parsed NEC blocks via encodeNEC; raw blocks via
+// sendRaw(frequency). Other protocols are logged and skipped (honest, not faked).
+void irFile(const String &path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) { notifyLine("DATA:ERR:ir,open\n"); return; }
+  static uint16_t raw[512];
+  String proto = ""; bool rawType = false, open = false; int khz = 38, rawN = 0;
+  uint32_t addr = 0, cmd = 0; bool haveAddr = false, haveCmd = false;
+  int sent = 0, skipped = 0;
+
+  // Emit the button accumulated so far, then clear for the next block.
+  auto flush = [&]() {
+    if (!open) return;
+    if (rawType && rawN > 1)                               { irsend.sendRaw(raw, rawN, khz); sent++; delay(40); }
+    else if (proto == "NEC" && haveAddr && haveCmd)        { irsend.sendNEC(irsend.encodeNEC(addr & 0xFF, cmd & 0xFF), 32); sent++; delay(40); }
+    else if (proto.length())                               { skipped++; }
+    proto = ""; rawType = false; rawN = 0; haveAddr = haveCmd = false; open = false;
+  };
+
+  while (f.available()) {
+    String ln = f.readStringUntil('\n'); ln.trim();
+    if (ln.startsWith("name:"))           { flush(); open = true; }
+    else if (ln.startsWith("type:"))      { rawType = (ln.indexOf("raw") >= 0); }
+    else if (ln.startsWith("protocol:"))  { proto = ln.substring(9); proto.trim(); proto.toUpperCase(); }
+    else if (ln.startsWith("frequency:")) { khz = ln.substring(10).toInt() / 1000; if (khz < 30 || khz > 60) khz = 38; }
+    else if (ln.startsWith("address:"))   { addr = strtoul(ln.substring(8).c_str(), nullptr, 16); haveAddr = true; }
+    else if (ln.startsWith("command:"))   { cmd = strtoul(ln.substring(8).c_str(), nullptr, 16); haveCmd = true; }
+    else if (ln.startsWith("data:") && rawType) {
+      rawN = 0; String d = ln.substring(5); int i = 0, L = d.length();
+      while (i < L && rawN < 512) {
+        while (i < L && d[i] == ' ') i++;
+        long v = 0; bool any = false;
+        while (i < L && d[i] >= '0' && d[i] <= '9') { v = v * 10 + (d[i] - '0'); i++; any = true; }
+        if (!any) break;
+        raw[rawN++] = (v > 65535) ? 65535 : (uint16_t)v;
+      }
+    }
+  }
+  flush();
+  f.close();
+  notifyLine("ir sent " + String(sent) + (skipped ? (" / skip " + String(skipped)) : "") + "\n");
+}
+
+// True if a .fu script contains any transmitting verb (needs the TX confirm).
+bool scriptHasTx(const String &path) {
+  File f = SD.open(path, FILE_READ); if (!f) return false;
+  bool tx = false;
+  while (f.available()) {
+    String ln = f.readStringUntil('\n'); ln.trim(); ln.toLowerCase();
+    if (ln.startsWith("tx ") || ln.startsWith("sub ") || ln.startsWith("ir ") || ln.startsWith("irfile ")) { tx = true; break; }
+  }
+  f.close();
+  return tx;
+}
+
+// Run a .fu macro. Verbs: caw <text> | wait <ms> | led <r> <g> <b> | nfc |
+// ir <PROTO> <hex> [bits] | irfile <path> | tx <mhz> <bits> | sub <path> | # comment.
+void runScript(const String &path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) { notifyLine("DATA:ERR:script,open\n"); return; }
+  int line = 0;
+  while (f.available()) {
+    String ln = f.readStringUntil('\n'); ln.trim();
+    if (!ln.length() || ln[0] == '#') continue;
+    if (++line > 400) break;
+    int sp = ln.indexOf(' ');
+    String verb = (sp < 0) ? ln : ln.substring(0, sp);
+    String rest = (sp < 0) ? "" : ln.substring(sp + 1); rest.trim();
+    String vl = verb; vl.toLowerCase();
+    if (vl == "caw")        { rest.replace("\"", ""); notifyLine(rest + "\n"); }
+    else if (vl == "wait")  { long ms = rest.toInt(); if (ms < 0) ms = 0; if (ms > 20000) ms = 20000; delay(ms); }
+    else if (vl == "led")   { int r = 0, g = 0, b = 0; sscanf(rest.c_str(), "%d %d %d", &r, &g, &b); setLed(r, g, b); }
+    else if (vl == "nfc")   { nfcPoll(); }
+    else if (vl == "ir")    { String p = rest; p.replace(" ", ","); irSend(p); }
+    else if (vl == "irfile"){ irFile(rest); }
+    else if (vl == "sub")   { playSub(rest); }
+    else if (vl == "tx")    {
+#if ALLOW_TX
+      int s2 = rest.indexOf(' ');
+      if (s2 > 0) { float fr = rest.substring(0, s2).toFloat(); String bits = rest.substring(s2 + 1); bits.trim();
+        if (fr > 250 && fr < 960 && bits.length()) doTransmit(fr, bits); }
+#endif
+    }
+    else if (vl == "jam" || vl == "flood" || vl == "noise") { notifyLine("jam refused (illegal)\n"); }
+    else notifyLine("? " + verb + "\n");
+  }
+  f.close();
+  notifyLine("script done\n");
+}
+
+// Rescan /flockedup/scripts for runnable .fu macros.
+void scanScripts() {
+  scriptN = 0;
+  if (!sdok) return;
+  SD.mkdir("/flockedup"); SD.mkdir(SCRIPT_ROOT);
+  File dir = SD.open(SCRIPT_ROOT); if (!dir) return;
+  File f = dir.openNextFile();
+  while (f && scriptN < 96) {
+    if (!f.isDirectory()) {
+      String nm = f.name(); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+      String low = nm; low.toLowerCase();
+      if (low.endsWith(".fu")) scriptNames[scriptN++] = nm;
+    }
+    f.close(); f = dir.openNextFile();
+  }
+  dir.close();
+}
+
+// On-device importer: anything dropped in /flockedup/import becomes a listed,
+// runnable Script. .sub/.ir are copied in and wrapped in a .fu that calls the
+// native player; loose .fu are copied straight through.
+int importDrop() {
+  if (!sdok) return 0;
+  SD.mkdir("/flockedup"); SD.mkdir(SCRIPT_ROOT); SD.mkdir(IMPORT_ROOT);
+  File dir = SD.open(IMPORT_ROOT); if (!dir) return 0;
+  int made = 0;
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String nm = f.name(); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+      f.close();
+      String low = nm; low.toLowerCase();
+      String src = String(IMPORT_ROOT) + "/" + nm;
+      String base = nm; int dot = base.lastIndexOf('.'); if (dot > 0) base = base.substring(0, dot);
+      String fu = String(SCRIPT_ROOT) + "/" + base + ".fu";
+      if (low.endsWith(".fu")) {
+        if (fuCopyFile(src, SCRIPT_ROOT)) { made++; notifyLine("+ " + nm + "\n"); }
+      } else if (low.endsWith(".sub")) {
+        fuCopyFile(src, SCRIPT_ROOT);
+        if (SD.exists(fu)) SD.remove(fu);
+        File o = SD.open(fu, FILE_WRITE);
+        if (o) { o.print("caw \""); o.print(base); o.print("\"\nsub "); o.print(String(SCRIPT_ROOT) + "/" + nm); o.print("\n"); o.close(); made++; notifyLine("+ " + base + ".fu (sub)\n"); }
+      } else if (low.endsWith(".ir")) {
+        fuCopyFile(src, SCRIPT_ROOT);
+        if (SD.exists(fu)) SD.remove(fu);
+        File o = SD.open(fu, FILE_WRITE);
+        if (o) { o.print("caw \""); o.print(base); o.print("\"\nirfile "); o.print(String(SCRIPT_ROOT) + "/" + nm); o.print("\n"); o.close(); made++; notifyLine("+ " + base + ".fu (ir)\n"); }
+      } else {
+        notifyLine("skip " + nm + "\n");
+      }
+    } else { f.close(); }
+    f = dir.openNextFile();
+  }
+  dir.close();
+  return made;
+}
+
+// Load the collection folders as stash targets.
+void stashLoad() {
+  stashN = 0; stashTop = 0;
+  if (!sdok) return;
+  SD.mkdir("/flockedup"); SD.mkdir(COLL_ROOT);
+  File dir = SD.open(COLL_ROOT); if (!dir) return;
+  File f = dir.openNextFile();
+  while (f && stashN < 96) {
+    if (f.isDirectory()) {
+      String nm = f.name(); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+      if (nm.length() && nm[0] != '.') stashNames[stashN++] = nm;
+    }
+    f.close(); f = dir.openNextFile();
+  }
+  dir.close();
+}
+
+// First unused stashN name for a brand-new collection (no on-device keyboard).
+String newStashName() {
+  for (int i = 1; i < 999; i++) {
+    String n = "stash" + String(i);
+    if (!SD.exists(String(COLL_ROOT) + "/" + n)) return n;
+  }
+  return "stash";
 }
 
 // ===========================================================================
@@ -1038,6 +1304,85 @@ void fuDrawConfirm() {
   tft.setTextColor(C_DIM); tft.setCursor(120, 100); tft.print("Back = cancel");
 }
 
+void fuDrawScripts(int sel) {
+  if (fuFull) { tft.fillScreen(C_BG); fuHeader("Scripts"); drawCrow(58, 92, fuMood); }
+  else        { tft.fillRect(112, 18, 208, 152, C_BG); }
+  int total = scriptN + 1, x = 118, y = 20;
+  for (int i = 0; i < total && i < 9; i++) {
+    String s = (i == 0) ? String("[ Import  /import ]") : scriptNames[i - 1];
+    if (s.length() > 30) s = s.substring(0, 30);
+    if (i == sel) { tft.fillRoundRect(x-6, y-2, 204, 13, 3, C_PANEL); tft.drawRoundRect(x-6, y-2, 204, 13, 3, C_BLOOD); }
+    tft.setTextColor(i == sel ? C_INK : (i == 0 ? C_AMBER : C_DIM));
+    tft.setTextSize(1); tft.setCursor(x, y); tft.print(s); y += 14;
+  }
+  if (scriptN == 0) {
+    tft.setTextColor(C_DIM); tft.setCursor(x, y); tft.print("drop .sub/.ir/.fu into");
+    y += 12; tft.setCursor(x, y); tft.print("/flockedup/import, Import");
+  }
+}
+
+void fuDrawFileMenu(int sel) {
+  tft.fillScreen(C_BG); fuHeader("File"); drawCrow(58, 92, fuMood);
+  String nm = fuFilePath; int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+  if (nm.length() > 30) nm = nm.substring(0, 30);
+  tft.setTextColor(C_AMBER); tft.setTextSize(1); tft.setCursor(116, 22); tft.print(nm);
+  const char* it[] = {"View", "Play", "Copy to stash", "Back"};
+  int x = 118, y = 48;
+  for (int i = 0; i < 4; i++) {
+    if (i == sel) { tft.fillRoundRect(x-6, y-2, 200, 14, 3, C_PANEL); tft.drawRoundRect(x-6, y-2, 200, 14, 3, C_BLOOD); }
+    tft.setTextColor(i == sel ? C_INK : C_DIM); tft.setCursor(x, y); tft.print(it[i]); y += 18;
+  }
+}
+
+void fuDrawStash(int sel) {
+  if (fuFull) { tft.fillScreen(C_BG); fuHeader("Copy to stash"); }
+  else        { tft.fillRect(0, 18, 320, 150, C_BG); }
+  int total = stashN + 1, x = 10, y = 24, rows = 8;
+  if (sel < stashTop) stashTop = sel;
+  if (sel >= stashTop + rows) stashTop = sel - rows + 1;
+  for (int i = stashTop; i < total && i < stashTop + rows; i++) {
+    String s = (i == 0) ? String("[ + New stash ]") : ("[" + stashNames[i - 1] + "]");
+    if (s.length() > 46) s = s.substring(0, 46);
+    if (i == sel) { tft.fillRoundRect(x-2, y-2, 300, 16, 3, C_PANEL); tft.drawRoundRect(x-2, y-2, 300, 16, 3, C_BLOOD); }
+    tft.setTextColor(i == sel ? C_INK : (i == 0 ? C_AMBER : C_DIM));
+    tft.setTextSize(1); tft.setCursor(x, y); tft.print(s); y += 17;
+  }
+}
+
+// Set up the live action screen and run a local (often transmitting) job to
+// completion, logging as it goes. Back from the result screen returns to ret.
+void fuRunPendingLocal() {
+  for (int i = 0; i < FU_LOGN; i++) fuLog[i] = ""; fuLogN = 0;
+  uiActionActive = true; localActive = false; fuMood = 3;
+  fuActionParent = fuConfirmReturn;
+  fuActionTitle = (fuConfirmKind == 1) ? "Run script" : (fuConfirmKind == 2) ? "Play sub" : "Play IR";
+  fuScr = S_ACTION; fuFull = true; fuDrawAction();
+  if      (fuConfirmKind == 1) runScript(fuPendingPath);
+  else if (fuConfirmKind == 2) playSub(fuPendingPath);
+  else                         irFile(fuPendingPath);
+  fuMood = 1;
+}
+
+// Launch a local job, routing through the TX-authorize screen when needed.
+void fuLaunchLocal(uint8_t kind, const String &path, FUScreen ret, bool needConfirm) {
+  fuConfirmKind = kind; fuPendingPath = path; fuConfirmReturn = ret;
+  if (needConfirm) { fuScr = S_CONFIRM; fuDirty = true; }
+  else fuRunPendingLocal();
+}
+
+// Copy the viewed capture into a chosen collection (stash). Index 0 = new stash.
+void fuStashPick(int sel) {
+  String dir;
+  if (sel == 0) { dir = String(COLL_ROOT) + "/" + newStashName(); SD.mkdir(dir); }
+  else          { dir = String(COLL_ROOT) + "/" + stashNames[sel - 1]; }
+  bool ok = fuCopyFile(fuFilePath, dir);
+  for (int i = 0; i < FU_LOGN; i++) fuLog[i] = ""; fuLogN = 0;
+  uiActionActive = true; fuMood = 2; fuActionParent = S_NEST;
+  fuActionTitle = "Stash";
+  fuScr = S_ACTION; fuFull = true; fuDrawAction();
+  notifyLine(ok ? ("copied to " + dir.substring(dir.lastIndexOf('/') + 1) + "\n") : "copy failed\n");
+}
+
 void fuDrawSettings(int sel) {
   if (fuFull) { tft.fillScreen(C_BG); fuHeader("Settings"); drawCrow(58, 92, fuMood); }
   else        { tft.fillRect(112, 18, 208, 152, C_BG); }
@@ -1067,7 +1412,7 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.6");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.7");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
@@ -1182,18 +1527,20 @@ void fuNestSelect() {
   if (!sdok || !nestN) return;
   String base = nestPath; if (!base.endsWith("/")) base += "/";
   if (nestIsDir[nestSel]) { nestLoad(base + nestNames[nestSel]); fuDirty = true; }
-  else { fuFilePath = base + nestNames[nestSel]; fuScr = S_FILE; fuDirty = true; }
+  else { fuFilePath = base + nestNames[nestSel]; fuScr = S_FILEMENU; fuSel = 0; fuDirty = true; }
 }
 
 void fuBack() {
   if (fuScr == S_ACTION) { fuStopAction(); fuScr = fuActionParent; fuDirty = true; return; }
-  if (fuScr == S_FILE)   { fuScr = S_NEST; fuDirty = true; return; }
+  if (fuScr == S_FILE)     { fuScr = S_FILEMENU; fuSel = 0; fuDirty = true; return; }
+  if (fuScr == S_FILEMENU) { fuScr = S_NEST; fuDirty = true; return; }
+  if (fuScr == S_STASH)    { fuScr = S_FILEMENU; fuSel = 2; fuDirty = true; return; }
   if (fuScr == S_NEST && nestPath != nestFloor) {
     int sl = nestPath.lastIndexOf('/'); String up = (sl <= 0) ? "/" : nestPath.substring(0, sl);
     if (up.length() < nestFloor.length()) up = nestFloor;
     nestLoad(up); fuDirty = true; return;
   }
-  if (fuScr == S_CONFIRM) { fuScr = S_WIFI; fuDirty = true; return; }
+  if (fuScr == S_CONFIRM) { fuScr = fuConfirmReturn; fuDirty = true; return; }
   if (fuScr == S_MAIN) return;
   fuScr = S_MAIN; fuSel = 0; fuDirty = true;
 }
@@ -1240,6 +1587,9 @@ void fuRender() {
     case S_ABOUT: fuDrawAbout(); break;
     case S_NEST:  fuDrawNest(); break;
     case S_FILE:  fuDrawFile(); break;
+    case S_FILEMENU: fuDrawFileMenu(fuSel); break;
+    case S_STASH: fuDrawStash(fuSel); break;
+    case S_SCRIPT: fuDrawScripts(fuSel); break;
     case S_ACTION:  fuDrawAction(); break;
     case S_CONFIRM: fuDrawConfirm(); break;
     default: break;
@@ -1254,6 +1604,8 @@ void fuRenderRows() {
     case S_WIFI:  fuDrawList("Wi-Fi",   WIFI_ITEMS, nullptr,  WIFI_N, fuSel); break;
     case S_SET:   fuDrawSettings(fuSel); break;
     case S_NEST:  fuDrawNest(); break;
+    case S_STASH: fuDrawStash(fuSel); break;
+    case S_SCRIPT: fuDrawScripts(fuSel); break;
     default: break;
   }
 }
@@ -1268,6 +1620,9 @@ void fuHandleInput() {
       case S_WIFI: fuSel = (fuSel + d + WIFI_N) % WIFI_N; fuRowsDirty = true; break;
       case S_SET:  fuSel = (fuSel + d + SETTINGS_N) % SETTINGS_N; fuRowsDirty = true; break;
       case S_NEST: if (nestN) { nestSel = (nestSel + d + nestN) % nestN; fuRowsDirty = true; } break;
+      case S_SCRIPT:   { int t = scriptN + 1; fuSel = (fuSel + d + t) % t; fuRowsDirty = true; } break;
+      case S_STASH:    { int t = stashN + 1;  fuSel = (fuSel + d + t) % t; fuRowsDirty = true; } break;
+      case S_FILEMENU: fuSel = (fuSel + d + 4) % 4; fuDirty = true; break;
       default: break;
     }
   }
@@ -1277,6 +1632,7 @@ void fuHandleInput() {
       case S_MAIN:
         if (MAIN_GOTO[fuSel] == S_NEST) { nestFloor = "/"; fuScr = S_NEST; nestLoad("/"); fuSel = 0; fuDirty = true; }
         else if (MAIN_GOTO[fuSel] == S_COLL) { SD.mkdir("/flockedup"); SD.mkdir(COLL_ROOT); nestFloor = COLL_ROOT; fuScr = S_NEST; nestLoad(COLL_ROOT); fuSel = 0; fuDirty = true; }
+        else if (MAIN_GOTO[fuSel] == S_SCRIPT) { scanScripts(); fuScr = S_SCRIPT; fuSel = 0; fuDirty = true; }
         else fuEnter(MAIN_GOTO[fuSel]);
         break;
       case S_SUB:  fuActionParent = S_SUB; fuStartAction(S_SUB, fuSel); break;
@@ -1284,13 +1640,44 @@ void fuHandleInput() {
       case S_IR:   fuActionParent = S_IR;  fuStartAction(S_IR, 0); break;
       case S_BLE:  fuActionParent = S_BLE; fuStartAction(S_BLE, 0); break;
       case S_WIFI:
-        if (fuSel >= 4) { fuPendingAction = fuSel; fuEnter(S_CONFIRM); }
+        if (fuSel >= 4) { fuPendingAction = fuSel; fuConfirmKind = 0; fuConfirmReturn = S_WIFI; fuEnter(S_CONFIRM); }
         else { fuActionParent = S_WIFI; fuStartAction(S_WIFI, fuSel); }
         break;
-      case S_CONFIRM: fuActionParent = S_WIFI; fuStartAction(S_WIFI, fuPendingAction); break;
+      case S_CONFIRM:
+        if (fuConfirmKind == 0) { fuActionParent = S_WIFI; fuStartAction(S_WIFI, fuPendingAction); }
+        else fuRunPendingLocal();
+        break;
       case S_SET:  fuSettingsSelect(fuSel); break;
       case S_NEST: fuNestSelect(); break;
-      case S_FILE: fuScr = S_NEST; fuDirty = true; break;
+      case S_FILE: fuScr = S_FILEMENU; fuSel = 0; fuDirty = true; break;
+      case S_FILEMENU: {
+        String low = fuFilePath; low.toLowerCase();
+        switch (fuSel) {
+          case 0: fuScr = S_FILE; fuDirty = true; break;                              // View
+          case 1:                                                                     // Play
+            if      (low.endsWith(".sub")) fuLaunchLocal(2, fuFilePath, S_FILEMENU, true);
+            else if (low.endsWith(".ir"))  fuLaunchLocal(3, fuFilePath, S_FILEMENU, true);
+            else if (low.endsWith(".fu"))  fuLaunchLocal(1, fuFilePath, S_FILEMENU, scriptHasTx(fuFilePath));
+            else { for (int i=0;i<FU_LOGN;i++) fuLog[i]=""; fuLogN=0; uiActionActive=true; fuActionParent=S_FILEMENU; fuActionTitle="Play"; fuScr=S_ACTION; fuFull=true; fuDrawAction(); notifyLine("not playable\n"); }
+            break;
+          case 2: stashLoad(); fuScr = S_STASH; fuSel = 0; fuDirty = true; break;      // Copy to stash
+          case 3: fuScr = S_NEST; fuDirty = true; break;                              // Back
+        }
+      } break;
+      case S_STASH:
+        if (fuSel == 0 || fuSel - 1 < stashN) fuStashPick(fuSel);
+        break;
+      case S_SCRIPT:
+        if (fuSel == 0) {
+          for (int i = 0; i < FU_LOGN; i++) fuLog[i] = ""; fuLogN = 0;
+          uiActionActive = true; fuMood = 1; fuActionParent = S_SCRIPT; fuActionTitle = "Import";
+          fuScr = S_ACTION; fuFull = true; fuDrawAction();
+          int m = importDrop(); notifyLine("imported " + String(m) + "\n"); scanScripts();
+        } else if (fuSel - 1 < scriptN) {
+          String p = String(SCRIPT_ROOT) + "/" + scriptNames[fuSel - 1];
+          fuLaunchLocal(1, p, S_SCRIPT, scriptHasTx(p));
+        }
+        break;
       default: break;
     }
   }
@@ -1393,6 +1780,10 @@ void loop() {
 #if ALLOW_TX
   if (txPending) { txPending = false; doTransmit(txFreq, txBits); }
 #endif
+  // Deferred script-engine jobs requested over BLE/serial (safe in loop ctx).
+  if (importPending)    { importPending = false; importDrop(); scanScripts(); notifyLine("DATA:IMPORT:done\n"); }
+  if (listPending)      { listPending = false; scanScripts(); for (int i = 0; i < scriptN; i++) notifyLine("DATA:SCRIPT:" + scriptNames[i] + "\n"); notifyLine("DATA:SCRIPT:end\n"); }
+  if (scriptRunPending) { scriptRunPending = false; String p = scriptRunPath; if (!p.startsWith("/")) p = String(SCRIPT_ROOT) + "/" + p; runScript(p); }
   if (irRxOn) irRxPump();
   if (uiActionActive && nfcPolling) { static uint32_t tN = 0; if (millis() - tN > 700) { tN = millis(); nfcPoll(); } }
 
