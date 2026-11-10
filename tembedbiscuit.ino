@@ -27,6 +27,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
@@ -38,6 +40,13 @@
 #include <IRsend.h>
 #include <IRrecv.h>
 #include <IRutils.h>
+#include <Preferences.h>
+#include <SD.h>
+#include <FS.h>
+
+// Declared up here (before the first function) so Arduino's auto-generated
+// prototypes, which reference it, see the type.
+enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_FILE, S_SET, S_ABOUT, S_ACTION, S_CONFIRM };
 
 // ---- Biscuit GATT contract (matches the app's BiscuitGatt, verified) --------
 #define SVC_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -45,7 +54,7 @@
 #define RESP_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a9"
 #define STAT_UUID "beb5483e-36e1-4688-b7f5-ea07361b26aa"
 
-#define DEV_NAME "Biscuit-TEmbed"
+#define DEV_NAME "Flocked Up"
 
 // ---- T-Embed CC1101 pins (official repo examples/utilities.h) ---------------
 #define PIN_SPI_SCK  11
@@ -147,6 +156,86 @@ String txBits = "";
 
 bool serialActive = false;
 
+// ===========================================================================
+// FLOCKED UP — standalone crow UI state (menu, theme, mascot, SD, settings).
+// A murder of crows. The Biscuit BLE bridge still runs underneath so the
+// Flying Flocks app can connect; on-device the menu is always open.
+// ===========================================================================
+#define SD_CS 13
+
+#define RGB565(r,g,b) ((uint16_t)((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3)))
+static const uint16_t C_BG     = RGB565(8,8,10);
+static const uint16_t C_PANEL  = RGB565(18,18,24);
+static const uint16_t C_INK    = RGB565(232,230,220);
+static const uint16_t C_BLOOD  = RGB565(202,28,36);
+static const uint16_t C_AMBER  = RGB565(242,172,42);
+static const uint16_t C_DIM    = RGB565(112,112,124);
+static const uint16_t C_CROW   = RGB565(22,22,28);
+static const uint16_t C_CROWHI = RGB565(64,70,92);
+static const uint16_t C_EYE    = RGB565(246,200,44);
+
+struct FUSettings {
+  bool    puns    = true;
+  uint8_t bright  = 40;     // LED brightness 20..100
+  uint8_t led     = 0;      // palette index
+  uint8_t mascot  = 0;      // default mood 0..3
+  bool    appLink = true;   // BLE advertising on
+};
+FUSettings cfg;
+Preferences prefs;
+
+const uint8_t LED_PAL[][3] = {{14,0,2},{0,12,2},{0,8,12},{10,0,12},{14,8,0},{12,12,12}};
+const char*   LED_NAME[]   = {"Blood","Green","Cyan","Purple","Amber","White"};
+const int     LED_PAL_N    = 6;
+
+bool sdok = false;
+
+// on-screen result log (fed by notifyLine while a local action runs)
+#define FU_LOGN 8
+String  fuLog[FU_LOGN];
+int     fuLogN = 0;
+bool    uiActionActive = false;    // an on-device action screen is running a job
+volatile bool localActive = false; // a local job wants the radios to run (no host)
+bool    nfcPolling = false;
+volatile bool bleScanRun = false;
+BLEScan *pBLEScan = nullptr;
+
+FUScreen fuScr = S_BOOT;
+FUScreen fuActionParent = S_MAIN;
+int      fuSel = 0;
+bool     fuDirty = true;
+uint8_t  fuMood = 0;               // 0 idle, 1 scan, 2 hit, 3 flip
+int      fuPendingAction = -1;
+String   fuActionTitle = "";
+String   fuFilePath = "";
+
+const char* MAIN_PLAIN[] = {"Sub-GHz","NFC / RFID","Infrared","Wi-Fi Recon","Bluetooth","SD Files","Settings","About"};
+const char* MAIN_PUN[]   = {"Caw-GHz","Peck","Flock Beam","Murder Scan","Scavenge","The Nest","Roost","The Murder"};
+const FUScreen MAIN_GOTO[] = {S_SUB,S_NFC,S_IR,S_WIFI,S_BLE,S_NEST,S_SET,S_ABOUT};
+const int   MAIN_N = 8;
+const char* SUB_ITEMS[]  = {"Scan & Decode","RSSI Sweep"};
+const int   SUB_N = 2;
+const char* WIFI_ITEMS[] = {"AP Scan","Stations","Probes","Pkt Monitor","Deauth","Beacon Spam"};
+const int   WIFI_N = 6;
+
+// SD browser state
+String  nestPath = "/";
+#define NEST_MAX 96
+String  nestNames[NEST_MAX];
+bool    nestIsDir[NEST_MAX];
+int     nestN = 0, nestSel = 0, nestTop = 0;
+
+bool hostUp() { return connected || serialActive || localActive; }
+
+void fuPushLog(const String &s) {
+  String t = s; t.trim();
+  if (!t.length()) return;
+  for (int i = FU_LOGN - 1; i > 0; i--) fuLog[i] = fuLog[i - 1];
+  fuLog[0] = t;
+  if (fuLogN < FU_LOGN) fuLogN++;
+  if (uiActionActive) fuDirty = true;
+}
+
 // Promiscuous sniffer -> loop() drain queue (BLE must not be touched in the cb).
 static const int SNQ = 48;
 struct SnRec { char line[72]; };
@@ -184,6 +273,7 @@ void notifyLine(const String &line) {
     respChar->notify();
     delay(6);
   }
+  if (uiActionActive) fuPushLog(line);
 }
 
 void setStatus(const char *o) {
@@ -191,7 +281,7 @@ void setStatus(const char *o) {
   if (statChar) {
     String j = "{\"status\":0,\"battery\":100,\"op\":\"";
     j += o; j += "\",\"heap\":"; j += String(ESP.getFreeHeap());
-    j += ",\"model\":\"Biscuit-TEmbed\",\"name\":\"" DEV_NAME "\",\"link\":\"";
+    j += ",\"model\":\"LilyGo T-Embed CC1101 Plus\",\"name\":\"" DEV_NAME "\",\"link\":\"";
     j += (linked ? "ok" : "required");
     j += "\"}";
     statChar->setValue((uint8_t *)j.c_str(), j.length());
@@ -374,9 +464,43 @@ bool emitWeather(float mhz, const uint16_t *iv, int n) {
   return true;
 }
 
+// PT2262 / EV1527 / tribit OOK remotes (garage, gate, alarm, cheap keyfobs).
+// Estimates the base time element (te), finds the long sync gap, then reads
+// tribit pairs: short+long = 0, long+short = 1. Returns the repeating code.
+bool decodeOOK(const uint16_t *iv, int n, int &nbits, uint32_t &code) {
+  if (n < 20) return false;
+  uint16_t te = 0xFFFF;
+  for (int i = 0; i < n; i++) if (iv[i] >= 120 && iv[i] < te) te = iv[i];
+  if (te == 0xFFFF || te < 120 || te > 900) return false;
+  int lo = te - te / 2,       hi = te + te / 2;        // ~1 te
+  int lo3 = te * 3 - te,      hi3 = te * 3 + te;        // ~3 te
+  int start = 0;
+  for (int i = 0; i < n - 1; i++) if (iv[i] >= (int)te * 10) { start = i + 1; break; }
+  uint32_t v = 0; int bits = 0;
+  for (int i = start; i + 1 < n && bits < 28; i += 2) {
+    int a = iv[i], b = iv[i + 1];
+    if (a >= (int)te * 8 || b >= (int)te * 8) break;    // next sync
+    bool aS = (a >= lo && a <= hi),  aL = (a >= lo3 && a <= hi3);
+    bool bS = (b >= lo && b <= hi),  bL = (b >= lo3 && b <= hi3);
+    int bit;
+    if (aS && bL)      bit = 0;
+    else if (aL && bS) bit = 1;
+    else break;
+    v = (v << 1) | bit; bits++;
+  }
+  if (bits >= 20 && bits <= 28) { nbits = bits; code = v; return true; }
+  return false;
+}
+
 void processBurst(float mhz, bool ook, const uint16_t *iv, int n) {
   if (ook) {
     if (emitWeather(mhz, iv, n)) return;
+    int nb; uint32_t code;
+    if (decodeOOK(iv, n, nb, code)) {
+      char hx[12]; sprintf(hx, "%06lX", (unsigned long)code);
+      notifyLine("DATA:SUBGHZ:" + String(mhz, 2) + ",OOK," + String(nb) + "," + hx + "\n");
+      return;
+    }
     String bits;
     for (int i = 0; i < n && bits.length() < 96; i++) bits += (iv[i] > 500) ? '1' : '0';
     notifyLine("DATA:KEYFOB:" + String(mhz, 2) + "," + String(n) + "," + bits + "\n");
@@ -397,7 +521,7 @@ void rfDecodeWindow() {
       applyRadioRaw(RF_DECODE_HZ[band], mod == 1);
       portENTER_CRITICAL(&capMux); capHead = 0; capTail = 0; portEXIT_CRITICAL(&capMux);
       uint32_t t0 = millis();
-      while (millis() - t0 < 400 && (connected || serialActive) && subScan) {
+      while (millis() - t0 < 400 && hostUp() && subScan) {
         int n = drainBurst(iv, CAP_MAX);
         if (n >= 16) processBurst(RF_DECODE_HZ[band], mod == 1, iv, n);
         delay(2);
@@ -441,13 +565,13 @@ void wifiScanBroadcast() {
   uint32_t t0 = millis();
   while (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
     delay(30);
-    if (!(connected || serialActive)) { WiFi.scanDelete(); return; }
+    if (!hostUp()) { WiFi.scanDelete(); return; }
     if (millis() - t0 > 15000) { WiFi.scanDelete(); return; }
   }
   int n = WiFi.scanComplete();
   if (n < 0) { WiFi.scanDelete(); return; }
   for (int i = 0; i < n; i++) {
-    if (!(connected || serialActive)) break;
+    if (!hostUp()) break;
     String line = "DATA:AP:" + WiFi.SSID(i) + "," + WiFi.BSSIDstr(i) + "," +
                   String(WiFi.channel(i)) + "," + String(WiFi.RSSI(i)) + "," +
                   authStr(WiFi.encryptionType(i)) + "\n";
@@ -619,9 +743,27 @@ void parseMac(const String &s, uint8_t *mac) {
     for (int i = 0; i < 6; i++) mac[i] = (uint8_t)v[i];
 }
 
+// BLE device discovery -> DATA:BLE (a Bluetooth feed for the app / Scavenge menu).
+// A short blocking pass; results are emitted in loop() context (BLE-safe).
+void runBleScanPass() {
+  if (!pBLEScan) { bleScanRun = false; return; }
+  BLEScanResults *res = pBLEScan->start(2, false);
+  int n = res ? res->getCount() : 0;
+  for (int i = 0; i < n && hostUp() && bleScanRun; i++) {
+    BLEAdvertisedDevice d = res->getDevice(i);
+    String name = d.haveName() ? d.getName() : String("");
+    name.replace(",", " "); name.replace("\n", " ");
+    // DATA:BT:<label>,<id/mac>,<rssi> — matches the app's wardrive BT ingestion,
+    // so node BLE devices flow into the Bluetooth panel, radar and map like any board.
+    notifyLine("DATA:BT:" + name + "," + d.getAddress().toString() + "," + String(d.getRSSI()) + "\n");
+  }
+  pBLEScan->clearResults();
+}
+
 void stopAll() {
   scanning = false; subScan = false;
   deauthRun = false; beaconRun = false;
+  bleScanRun = false;
   stopSniffer();
   setStatus("idle");
   setLed(0, 0, 8);
@@ -641,7 +783,7 @@ void handleCommand(String v) {
       linked = true; linkNeedPending = false; linkBadTries = 0; linkBackoffUntil = 0;
       notifyLine("DATA:LINK:ok\n");
       setStatus(op.c_str());
-      drawStatus("BLE: linked", "op: idle");
+      fuDirty = true;
     } else {
       if (++linkBadTries >= 5) { linkBackoffUntil = millis() + 5000; linkBadTries = 0; }  // short backoff
       notifyLine("DATA:LINK:bad\n");
@@ -678,6 +820,7 @@ void handleCommand(String v) {
   if (v.startsWith("CMD:nfcread") || v.startsWith("CMD:nfc"))   { nfcPoll(); return; }
   if (v.startsWith("CMD:irsend:"))      { irSend(v.substring(11)); return; }
   if (v.startsWith("CMD:irsniff"))      { irRxOn = true; irrecv.enableIRIn(); notifyLine("DATA:MODE:irsniff,start\n"); return; }
+  if (v.startsWith("CMD:blescan") || v.startsWith("CMD:btscan") || v.startsWith("CMD:sniffbt")) { bleScanRun = true; setStatus("ble"); setLed(0,0,12); notifyLine("DATA:MODE:bt,start\n"); return; }
 
   // Generic wardrive sweep (main DATA:AP feed).
   if (v.startsWith("CMD:scan") || v.startsWith("CMD:sniff") || v.startsWith("CMD:aplist")) {
@@ -695,12 +838,12 @@ class SrvCallbacks : public BLEServerCallbacks {
     connected = true;
     linked = false; linkNeedPending = true; linkNeedAt = millis() + 400;  // lock this session
     setLed(16, 8, 0);                     // amber = connected but not linked
-    drawStatus("BLE: connected", "enter link code");
+    fuDirty = true;
   }
   void onDisconnect(BLEServer *s) override {
     connected = false; linked = false; stopAll();   // relock; code persists until reboot/regen
-    drawStatus("BLE: advertising", "waiting for app");
-    BLEDevice::startAdvertising();
+    fuDirty = true;
+    if (cfg.appLink) BLEDevice::startAdvertising();
   }
 };
 
@@ -717,9 +860,331 @@ void pollSerialCommands() {
 // ===========================================================================
 // setup / loop
 // ===========================================================================
+// ===========================================================================
+// FLOCKED UP — crow UI (input, theme, mascot, screens, SD browser, settings)
+// ===========================================================================
+int8_t fuEnc() {
+  static const int8_t TAB[16] = {0,-1,1,0, 1,0,0,-1, -1,0,0,1, 0,1,-1,0};
+  static uint8_t prev = 0; static int8_t acc = 0;
+  uint8_t cur = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
+  acc += TAB[(prev << 2) | cur];
+  prev = cur;
+  if (acc >= 4)  { acc = 0; return +1; }
+  if (acc <= -4) { acc = 0; return -1; }
+  return 0;
+}
+
+bool fuSelectPressed() {           // ENC_KEY, debounced press edge
+  static uint32_t last = 0; static bool down = false;
+  bool now = digitalRead(ENC_KEY) == LOW;
+  if (now && !down && millis() - last > 160) { down = true; last = millis(); return true; }
+  if (!now) down = false;
+  return false;
+}
+
+void applyLed() { setLed(LED_PAL[cfg.led][0], LED_PAL[cfg.led][1], LED_PAL[cfg.led][2]); }
+
+void loadCfg() {
+  prefs.begin("flocked", true);
+  cfg.puns    = prefs.getBool("puns", true);
+  cfg.bright  = prefs.getUChar("bright", 40);
+  cfg.led     = prefs.getUChar("led", 0);
+  cfg.mascot  = prefs.getUChar("mascot", 0);
+  cfg.appLink = prefs.getBool("applink", true);
+  prefs.end();
+  if (cfg.bright < 20) cfg.bright = 20;
+  if (cfg.led >= LED_PAL_N) cfg.led = 0;
+  if (cfg.mascot > 3) cfg.mascot = 0;
+}
+void saveCfg() {
+  prefs.begin("flocked", false);
+  prefs.putBool("puns", cfg.puns);
+  prefs.putUChar("bright", cfg.bright);
+  prefs.putUChar("led", cfg.led);
+  prefs.putUChar("mascot", cfg.mascot);
+  prefs.putBool("applink", cfg.appLink);
+  prefs.end();
+}
+
+// --- procedural crow mascot (mood: 0 idle, 1 scan, 2 hit, 3 flip) ----------
+void drawCrow(int cx, int cy, uint8_t mood) {
+  tft.fillTriangle(cx-2, cy+6, cx-32, cy+2, cx-24, cy+24, C_CROW);     // tail
+  tft.fillRoundRect(cx-20, cy-12, 40, 42, 14, C_CROW);                 // body
+  tft.fillTriangle(cx-14, cy-4, cx+14, cy-8, cx+6, cy+18, C_CROWHI);   // wing sheen
+  tft.fillTriangle(cx-14, cy-4, cx+6, cy+18, cx-12, cy+16, C_CROW);
+  tft.fillCircle(cx+8, cy-16, 15, C_CROW);                             // head
+  int bl = (mood == 1 || mood == 2) ? 17 : 12;                        // beak (open on scan/hit)
+  tft.fillTriangle(cx+20, cy-20, cx+20+bl, cy-16, cx+20, cy-11, C_AMBER);
+  if (mood == 1 || mood == 2) tft.fillTriangle(cx+20, cy-14, cx+20+bl-4, cy-14, cx+20, cy-8, C_AMBER);
+  uint16_t eyec = (mood == 3) ? C_BLOOD : C_EYE;                       // eye
+  tft.fillCircle(cx+11, cy-18, 4, eyec);
+  tft.fillCircle(cx+12, cy-18, 2, C_BG);
+  if (mood == 0) tft.fillRect(cx+7, cy-22, 9, 2, C_CROW);              // calm lid
+  if (mood == 2) tft.drawCircle(cx+11, cy-18, 6, C_INK);              // hit: wide
+  tft.drawLine(cx-4, cy+28, cx-6, cy+36, C_AMBER);                     // legs
+  tft.drawLine(cx+4, cy+28, cx+6, cy+36, C_AMBER);
+  if (mood == 3) { tft.fillRoundRect(cx+16, cy-4, 5, 22, 2, C_CROWHI); tft.fillCircle(cx+18, cy-5, 3, C_INK); }
+}
+
+void fuHeader(const char* title) {
+  tft.fillRect(0, 0, 320, 16, C_PANEL);
+  tft.setTextSize(1);
+  tft.setTextColor(C_BLOOD); tft.setCursor(6, 4);   tft.print("FLOCKED UP");
+  tft.setTextColor(C_DIM);   tft.setCursor(182, 4); tft.print(title);
+  tft.fillCircle(312, 8, 3, connected ? (linked ? C_AMBER : C_BLOOD) : C_DIM);  // app-link dot
+}
+
+void fuDrawList(const char* title, const char* const* plain, const char* const* pun, int n, int sel) {
+  tft.fillScreen(C_BG);
+  fuHeader(title);
+  drawCrow(58, 92, fuMood);
+  int x = 120, y = 22;
+  for (int i = 0; i < n; i++) {
+    const char* lbl = (cfg.puns && pun) ? pun[i] : plain[i];
+    if (i == sel) { tft.fillRoundRect(x-6, y-3, 200, 16, 4, C_PANEL); tft.drawRoundRect(x-6, y-3, 200, 16, 4, C_BLOOD); }
+    tft.setTextColor(i == sel ? C_INK : C_DIM); tft.setTextSize(1); tft.setCursor(x, y+1); tft.print(lbl);
+    y += 18;
+  }
+}
+
+void fuDrawAction() {
+  tft.fillScreen(C_BG);
+  fuHeader(fuActionTitle.c_str());
+  drawCrow(58, 70, fuMood);
+  tft.setTextColor(C_AMBER); tft.setTextSize(1); tft.setCursor(8, 150); tft.print("hold back = stop");
+  int x = 120, y = 22;
+  for (int i = 0; i < fuLogN; i++) {
+    tft.setTextColor(i == 0 ? C_INK : C_DIM); tft.setCursor(x, y);
+    String s = fuLog[i]; if (s.length() > 33) s = s.substring(0, 33);
+    tft.print(s); y += 16;
+  }
+  if (fuLogN == 0) { tft.setTextColor(C_DIM); tft.setCursor(x, y); tft.print("listening..."); }
+}
+
+void fuDrawConfirm() {
+  tft.fillScreen(C_BG); fuHeader("Authorize");
+  drawCrow(58, 92, 3);
+  tft.setTextColor(C_AMBER); tft.setTextSize(1);
+  tft.setCursor(120, 34); tft.print("Your OWN gear only.");
+  tft.setCursor(120, 50); tft.print("This TRANSMITS.");
+  tft.setTextColor(C_INK); tft.setCursor(120, 82); tft.print("Press = I confirm");
+  tft.setTextColor(C_DIM); tft.setCursor(120, 100); tft.print("Back = cancel");
+}
+
+void fuDrawSettings(int sel) {
+  tft.fillScreen(C_BG); fuHeader("Settings");
+  drawCrow(58, 92, fuMood);
+  char buf[7][30];
+  snprintf(buf[0], 30, "Crow puns: %s", cfg.puns ? "ON" : "off");
+  snprintf(buf[1], 30, "LED: %s", LED_NAME[cfg.led]);
+  snprintf(buf[2], 30, "Brightness: %d", cfg.bright);
+  snprintf(buf[3], 30, "Mascot mood: %d", cfg.mascot);
+  snprintf(buf[4], 30, "App link: %s", cfg.appLink ? "ON" : "off");
+  snprintf(buf[5], 30, "Regen link code");
+  snprintf(buf[6], 30, "Save & back");
+  int x = 120, y = 22;
+  for (int i = 0; i < 7; i++) {
+    if (i == sel) { tft.fillRoundRect(x-6, y-3, 200, 16, 4, C_PANEL); tft.drawRoundRect(x-6, y-3, 200, 16, 4, C_BLOOD); }
+    tft.setTextColor(i == sel ? C_INK : C_DIM); tft.setTextSize(1); tft.setCursor(x, y+1); tft.print(buf[i]);
+    y += 19;
+  }
+}
+
+void fuDrawAbout() {
+  tft.fillScreen(C_BG); fuHeader("About");
+  drawCrow(58, 92, 3);
+  tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
+  tft.setTextSize(1);
+  tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.2");
+  tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
+  tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
+  char cc[8]; sprintf(cc, "%06u", linkCode);
+  tft.setCursor(118, 126); tft.print("link "); tft.print(cc);
+}
+
+void nestLoad(const String &path) {
+  nestPath = path; nestN = 0; nestSel = 0; nestTop = 0;
+  if (!sdok) return;
+  File dir = SD.open(path);
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  File f = dir.openNextFile();
+  while (f && nestN < NEST_MAX) {
+    String nm = f.name(); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+    if (nm.length() && nm[0] != '.') { nestNames[nestN] = nm; nestIsDir[nestN] = f.isDirectory(); nestN++; }
+    f.close(); f = dir.openNextFile();
+  }
+  dir.close();
+}
+
+void fuDrawNest() {
+  tft.fillScreen(C_BG); fuHeader("The Nest");
+  if (!sdok) { tft.setTextColor(C_BLOOD); tft.setTextSize(2); tft.setCursor(60, 76); tft.print("No SD card"); return; }
+  tft.setTextColor(C_DIM); tft.setTextSize(1); tft.setCursor(6, 20);
+  String p = nestPath; if (p.length() > 44) p = p.substring(p.length() - 44); tft.print(p);
+  int rows = 7, x = 6, y = 38;
+  if (nestSel < nestTop) nestTop = nestSel;
+  if (nestSel >= nestTop + rows) nestTop = nestSel - rows + 1;
+  if (nestN == 0) { tft.setCursor(6, 44); tft.print("(empty)"); return; }
+  for (int i = nestTop; i < nestN && i < nestTop + rows; i++) {
+    if (i == nestSel) { tft.fillRoundRect(x-2, y-2, 308, 16, 3, C_PANEL); tft.drawRoundRect(x-2, y-2, 308, 16, 3, C_BLOOD); }
+    tft.setTextColor(nestIsDir[i] ? C_AMBER : (i == nestSel ? C_INK : C_DIM));
+    tft.setCursor(x, y);
+    String nm = nestNames[i]; if (nm.length() > 48) nm = nm.substring(0, 48);
+    tft.print(nestIsDir[i] ? ("[" + nm + "]") : nm);
+    y += 17;
+  }
+}
+
+void fuDrawFile() {
+  tft.fillScreen(C_BG); fuHeader("File");
+  String nm = fuFilePath; int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+  tft.setTextColor(C_AMBER); tft.setTextSize(1); tft.setCursor(6, 20); tft.print(nm);
+  File f = SD.open(fuFilePath);
+  int y = 40;
+  if (f) {
+    for (int i = 0; i < 7 && f.available(); i++) {
+      String ln = f.readStringUntil('\n'); ln.trim();
+      if (ln.length() > 52) ln = ln.substring(0, 52);
+      tft.setTextColor(C_DIM); tft.setCursor(6, y); tft.print(ln); y += 16;
+    }
+    f.close();
+  }
+  tft.setTextColor(C_DIM); tft.setCursor(6, 152); tft.print("back = return");
+}
+
+void fuStartAction(FUScreen from, int idx) {
+  for (int i = 0; i < FU_LOGN; i++) fuLog[i] = ""; fuLogN = 0;
+  uiActionActive = true; localActive = true; nfcPolling = false; fuMood = 1;
+  if (from == S_SUB) {
+    fuActionTitle = (idx == 0) ? "Sub-GHz decode" : "RSSI sweep";
+    subScan = true; setStatus("subghz"); setLed(8, 4, 0);
+  } else if (from == S_NFC) {
+    fuActionTitle = "NFC read"; nfcPolling = true; setStatus("nfc"); setLed(0, 8, 8);
+  } else if (from == S_IR) {
+    fuActionTitle = "IR sniff"; irRxOn = true; irrecv.enableIRIn(); setStatus("irsniff"); setLed(10, 0, 10);
+  } else if (from == S_WIFI) {
+    switch (idx) {
+      case 0: fuActionTitle = "AP scan";     scanning = true; setStatus("wardrive");  setLed(0, 10, 0); break;
+      case 1: fuActionTitle = "Stations";    startSniffer('S'); setStatus("stations"); setLed(0, 8, 4); break;
+      case 2: fuActionTitle = "Probes";      startSniffer('P'); setStatus("probes");   setLed(0, 8, 4); break;
+      case 3: fuActionTitle = "Pkt monitor"; startSniffer('M'); setStatus("pktmon");   setLed(0, 6, 8); break;
+      case 4: fuActionTitle = "Deauth";      deauthRun = true; setStatus("deauth");    setLed(12, 0, 0); fuMood = 3; break;
+      case 5: fuActionTitle = "Beacon spam"; beaconRun = true; setStatus("beaconspam");setLed(12, 0, 12); fuMood = 3; break;
+    }
+  } else if (from == S_BLE) {
+    fuActionTitle = "BLE scan"; bleScanRun = true; setStatus("ble"); setLed(0, 0, 12);
+  }
+  fuScr = S_ACTION; fuDirty = true;
+}
+
+void fuStopAction() {
+  stopAll(); irRxOn = false; nfcPolling = false;
+  uiActionActive = false; localActive = false;
+  fuMood = cfg.mascot; applyLed();
+}
+
+void fuEnter(FUScreen s) { fuScr = s; fuSel = 0; fuDirty = true; }
+
+void fuSettingsSelect(int i) {
+  switch (i) {
+    case 0: cfg.puns = !cfg.puns; break;
+    case 1: cfg.led = (cfg.led + 1) % LED_PAL_N; applyLed(); break;
+    case 2: cfg.bright += 20; if (cfg.bright > 100) cfg.bright = 20; leds.setBrightness(cfg.bright); applyLed(); break;
+    case 3: cfg.mascot = (cfg.mascot + 1) % 4; fuMood = cfg.mascot; break;
+    case 4: cfg.appLink = !cfg.appLink; if (cfg.appLink) BLEDevice::startAdvertising(); else BLEDevice::stopAdvertising(); break;
+    case 5: genLinkCode(); linked = false; break;
+    case 6: saveCfg(); fuEnter(S_MAIN); return;
+  }
+  fuDirty = true;
+}
+
+void fuNestSelect() {
+  if (!sdok || !nestN) return;
+  String base = nestPath; if (!base.endsWith("/")) base += "/";
+  if (nestIsDir[nestSel]) { nestLoad(base + nestNames[nestSel]); fuDirty = true; }
+  else { fuFilePath = base + nestNames[nestSel]; fuScr = S_FILE; fuDirty = true; }
+}
+
+void fuBack() {
+  if (fuScr == S_ACTION) { fuStopAction(); fuScr = fuActionParent; fuDirty = true; return; }
+  if (fuScr == S_FILE)   { fuScr = S_NEST; fuDirty = true; return; }
+  if (fuScr == S_NEST && nestPath != "/" && nestPath.length() > 1) {
+    int sl = nestPath.lastIndexOf('/'); String up = (sl <= 0) ? "/" : nestPath.substring(0, sl);
+    if (up.length() == 0) up = "/"; nestLoad(up); fuDirty = true; return;
+  }
+  if (fuScr == S_CONFIRM) { fuScr = S_WIFI; fuDirty = true; return; }
+  if (fuScr == S_MAIN) return;
+  fuScr = S_MAIN; fuSel = 0; fuDirty = true;
+}
+
+void fuBootSplash() {
+  tft.fillScreen(C_BG);
+  drawCrow(160, 66, 3);
+  tft.setTextSize(3); tft.setTextColor(C_BLOOD); tft.setCursor(66, 108); tft.print("FLOCKED UP");
+  tft.setTextSize(1); tft.setTextColor(C_AMBER); tft.setCursor(96, 140); tft.print("a murder of crows  \xB7  FTM");
+  for (int k = 0; k < 3; k++) { setLed(14, 0, 2); delay(110); setLed(0, 0, 0); delay(80); }
+  applyLed();
+  delay(650);
+}
+
+void fuRender() {
+  switch (fuScr) {
+    case S_MAIN:  fuDrawList("menu",    MAIN_PLAIN, MAIN_PUN, MAIN_N, fuSel); break;
+    case S_SUB:   fuDrawList("Sub-GHz", SUB_ITEMS,  nullptr,  SUB_N,  fuSel); break;
+    case S_WIFI:  fuDrawList("Wi-Fi",   WIFI_ITEMS, nullptr,  WIFI_N, fuSel); break;
+    case S_NFC:   { const char* it[] = {"Read tag"};      fuDrawList("NFC",      it, nullptr, 1, fuSel); } break;
+    case S_IR:    { const char* it[] = {"Sniff / learn"}; fuDrawList("Infrared", it, nullptr, 1, fuSel); } break;
+    case S_BLE:   { const char* it[] = {"Scan devices"};  fuDrawList("Bluetooth", it, nullptr, 1, fuSel); } break;
+    case S_SET:   fuDrawSettings(fuSel); break;
+    case S_ABOUT: fuDrawAbout(); break;
+    case S_NEST:  fuDrawNest(); break;
+    case S_FILE:  fuDrawFile(); break;
+    case S_ACTION:  fuDrawAction(); break;
+    case S_CONFIRM: fuDrawConfirm(); break;
+    default: break;
+  }
+}
+
+void fuHandleInput() {
+  int8_t d = fuEnc();
+  if (d != 0) {
+    switch (fuScr) {
+      case S_MAIN: fuSel = (fuSel + d + MAIN_N) % MAIN_N; fuDirty = true; break;
+      case S_SUB:  fuSel = (fuSel + d + SUB_N) % SUB_N;   fuDirty = true; break;
+      case S_WIFI: fuSel = (fuSel + d + WIFI_N) % WIFI_N; fuDirty = true; break;
+      case S_SET:  fuSel = (fuSel + d + 7) % 7;           fuDirty = true; break;
+      case S_NEST: if (nestN) { nestSel = (nestSel + d + nestN) % nestN; fuDirty = true; } break;
+      default: break;
+    }
+  }
+  if (fuSelectPressed()) {
+    switch (fuScr) {
+      case S_MAIN:
+        if (MAIN_GOTO[fuSel] == S_NEST) { fuScr = S_NEST; nestLoad("/"); fuSel = 0; fuDirty = true; }
+        else fuEnter(MAIN_GOTO[fuSel]);
+        break;
+      case S_SUB:  fuActionParent = S_SUB; fuStartAction(S_SUB, fuSel); break;
+      case S_NFC:  fuActionParent = S_NFC; fuStartAction(S_NFC, 0); break;
+      case S_IR:   fuActionParent = S_IR;  fuStartAction(S_IR, 0); break;
+      case S_BLE:  fuActionParent = S_BLE; fuStartAction(S_BLE, 0); break;
+      case S_WIFI:
+        if (fuSel >= 4) { fuPendingAction = fuSel; fuEnter(S_CONFIRM); }
+        else { fuActionParent = S_WIFI; fuStartAction(S_WIFI, fuSel); }
+        break;
+      case S_CONFIRM: fuActionParent = S_WIFI; fuStartAction(S_WIFI, fuPendingAction); break;
+      case S_SET:  fuSettingsSelect(fuSel); break;
+      case S_NEST: fuNestSelect(); break;
+      case S_FILE: fuScr = S_NEST; fuDirty = true; break;
+      default: break;
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(600);
+  loadCfg();
 
   pinMode(BOARD_PWR_EN, OUTPUT); digitalWrite(BOARD_PWR_EN, HIGH);  // keep board powered
   pinMode(RF_SW0, OUTPUT); pinMode(RF_SW1, OUTPUT);
@@ -729,13 +1194,15 @@ void setup() {
 
   genLinkCode();   // fresh 6-digit link code for this boot
 
-  leds.begin(); leds.setBrightness(40); setLed(0, 0, 8);
+  leds.begin(); leds.setBrightness(cfg.bright); setLed(0, 0, 8);
 
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, -1);
   pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
   tft.init(170, 320);
-  tft.setRotation(0);
-  drawStatus("booting...", "");
+  tft.setRotation(3);              // landscape 320x170 (crow UI)
+  sdok = SD.begin(SD_CS, SPI, 10000000);
+  Serial.println(sdok ? "[sd] mounted." : "[sd] no card.");
+  fuBootSplash();
 
   Wire.begin(I2C_SDA, I2C_SCL);
   nfc.begin();
@@ -770,41 +1237,46 @@ void setup() {
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
   adv->setScanResponse(true);
-  BLEDevice::startAdvertising();
+  if (cfg.appLink) BLEDevice::startAdvertising();
 
-  drawStatus("BLE: advertising", "waiting for app");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+
+  fuMood = cfg.mascot; fuScr = S_MAIN; fuDirty = true;
   Serial.println("[ble] advertising as \"" DEV_NAME "\" (service 4fafc201).");
 }
 
 void loop() {
   pollSerialCommands();
 
-  // Link gate: prompt the central once notifications should be up; regenerate the
-  // code on an encoder-button press.
+  // BLE link gate: prompt the central once notifications should be up.
   if (linkNeedPending && connected && !linked && millis() >= linkNeedAt) {
     linkNeedPending = false;
     notifyLine("DATA:LINK:need\n");
   }
-  static uint32_t lastKey = 0;
-  if (digitalRead(ENC_KEY) == LOW && millis() - lastKey > 500) {
-    lastKey = millis();
-    genLinkCode(); linked = false;
-    drawStatus(connected ? "BLE: connected" : "BLE: advertising", "enter link code");
-    if (connected) notifyLine("DATA:LINK:need\n");
-  }
-  // Hold the side/back button (USER_KEY = GPIO6) ~1.5s to return to the Launcher.
-  static uint32_t userKeyDownAt = 0;
+
+  // ---- crow UI input (encoder + select) ----
+  fuHandleInput();
+
+  // USER_KEY (GPIO6): short press = back, hold ~1.2s = return to Launcher.
+  static uint32_t ukDown = 0; static bool ukHandled = false;
   if (digitalRead(USER_KEY) == LOW) {
-    if (userKeyDownAt == 0) userKeyDownAt = millis();
-    else if (millis() - userKeyDownAt > 1500) returnToLauncher();  // reboots while held
-  } else userKeyDownAt = 0;
+    if (ukDown == 0) { ukDown = millis(); ukHandled = false; }
+    else if (!ukHandled && millis() - ukDown > 1200) { ukHandled = true; returnToLauncher(); }
+  } else {
+    if (ukDown && !ukHandled) fuBack();
+    ukDown = 0;
+  }
 
 #if ALLOW_TX
   if (txPending) { txPending = false; doTransmit(txFreq, txBits); }
 #endif
   if (irRxOn) irRxPump();
+  if (uiActionActive && nfcPolling) { static uint32_t tN = 0; if (millis() - tN > 700) { tN = millis(); nfcPoll(); } }
 
-  bool host = connected || serialActive;
+  bool host = hostUp();
 
   if (host && scanning) {
     wifiScanBroadcast();
@@ -826,9 +1298,16 @@ void loop() {
     sendDeauthBurst(); delay(50);
   } else if (host && beaconRun) {
     sendBeaconBurst(); delay(50);
+  } else if (host && bleScanRun) {
+    runBleScanPass();
   } else {
-    delay(60);
+    delay(16);
   }
+
+  // ---- render (redraw on change; action screen refreshes for live log) ----
+  static uint32_t lastDraw = 0;
+  if (fuDirty) { fuRender(); fuDirty = false; lastDraw = millis(); }
+  else if (fuScr == S_ACTION && millis() - lastDraw > 350) { fuRender(); lastDraw = millis(); }
 
   static uint32_t lastStat = 0;
   if (millis() - lastStat > 2000) { lastStat = millis(); setStatus(op.c_str()); }
