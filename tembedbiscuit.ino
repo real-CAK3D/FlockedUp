@@ -49,7 +49,7 @@
 
 // Declared up here (before the first function) so Arduino's auto-generated
 // prototypes, which reference it, see the type.
-enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_COLL, S_FILE, S_FILEMENU, S_STASH, S_SCRIPT, S_SET, S_ABOUT, S_ACTION, S_CONFIRM };
+enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_COLL, S_FILE, S_FILEMENU, S_STASH, S_SCRIPT, S_SET, S_ABOUT, S_LINK, S_ACTION, S_CONFIRM };
 
 // ---- Biscuit GATT contract (matches the app's BiscuitGatt, verified) --------
 #define SVC_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -851,6 +851,7 @@ void handleCommand(String v) {
       linked = true; linkNeedPending = false; linkBadTries = 0; linkBackoffUntil = 0;
       notifyLine("DATA:LINK:ok\n");
       setStatus(op.c_str());
+      if (fuScr == S_LINK) fuScr = S_MAIN;  // linked — drop the code banner
       fuDirty = true;
     } else {
       if (++linkBadTries >= 5) { linkBackoffUntil = millis() + 5000; linkBadTries = 0; }  // short backoff
@@ -911,6 +912,7 @@ class SrvCallbacks : public BLEServerCallbacks {
     connected = true;
     linked = false; linkNeedPending = true; linkNeedAt = millis() + 400;  // lock this session
     setLed(16, 8, 0);                     // amber = connected but not linked
+    if (fuScr == S_MAIN) fuScr = S_LINK;  // surface the link code the moment the app connects
     fuDirty = true;
   }
   void onDisconnect(BLEServer *s) override {
@@ -1229,23 +1231,84 @@ void saveCfg() {
 }
 
 // --- crow mascot: embedded pixel sprite drawn in purple, centered at (cx,cy) --
-static uint16_t crowBuf[120 * 100];
-void drawCrow(int cx, int cy, uint8_t mood) {
-  const uint8_t *bmp; int w, h;
+// ---------------------------------------------------------------------------
+// Animated crow mascot — a fluid, Flipper-dolphin-style pixel loop. The crow
+// lives in a fixed left-column panel (x4..112, y20..136) that is re-blitted in
+// one atomic drawRGBBitmap each frame, so animating it never disturbs the menu,
+// the border, or the 3-crow accent.
+// ---------------------------------------------------------------------------
+#define CROW_PX 4
+#define CROW_PY 20
+#define CROW_PW 108
+#define CROW_PH 116
+static uint16_t crowBuf[CROW_PW * CROW_PH];   // panel compositing buffer
+
+// Little 9x5 crow glyph, used x3 as the border-corner accent.
+static const uint8_t BIRD9[] PROGMEM = { 0x80,0x80, 0x63,0x00, 0x3E,0x00, 0x1C,0x00, 0x08,0x00 };
+
+// Compose background + the current animation frame of the crow and blit once.
+void drawCrowPanel(uint8_t mood, uint32_t ms) {
+  const uint8_t *bmp; int w, h; int dy = 0;
+  uint32_t ph = ms / 90;                       // ~11 logical fps
   switch (mood) {
-    case 1:  bmp = CROW_SCAN; w = CROW_SCAN_W; h = CROW_SCAN_H; break;
-    case 2:  bmp = CROW_HIT;  w = CROW_HIT_W;  h = CROW_HIT_H;  break;
-    case 3:  bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; break;
-    default: bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; break;
+    case 1:  // scan — wing flap + quick bob
+      if (ph & 1) { bmp = CROW_SCAN; w = CROW_SCAN_W; h = CROW_SCAN_H; dy = -2; }
+      else        { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
+      break;
+    case 2:  // hit — triumphant hop
+      bmp = CROW_HIT; w = CROW_HIT_W; h = CROW_HIT_H;
+      dy = (ph % 4 < 2) ? -3 : 0;
+      break;
+    case 3:  // flip — flipping off, wing alternating
+      if (ph & 1) { bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; dy = -1; }
+      else        { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
+      break;
+    default: { // idle — gentle breathing bob + a wing-flap every ~5s
+      static const int8_t BOB[8] = {0, -1, -2, -2, -1, 0, 0, 1};
+      dy = BOB[ph & 7];
+      if ((ms % 5000) < 180) { bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; dy -= 1; }
+      else                   { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
+    } break;
   }
-  // Expand the 1-bit mask to RGB565 and blit the whole block in one windowed
-  // transaction (drawRGBBitmap) — far faster than per-pixel drawBitmap.
-  if (w > 120 || h > 100) { tft.drawBitmap(cx - w / 2, cy - h / 2, bmp, w, h, C_PLUM); return; }
+  for (int i = 0; i < CROW_PW * CROW_PH; i++) crowBuf[i] = C_BG;
+  int ox = (58 - CROW_PX) - w / 2;
+  int oy = (92 - CROW_PY) - h / 2 + dy;
   int rb = (w + 7) / 8;
-  for (int y = 0; y < h; y++)
-    for (int x = 0; x < w; x++)
-      crowBuf[y * w + x] = (pgm_read_byte(&bmp[y * rb + x / 8]) & (0x80 >> (x % 8))) ? C_PLUM : C_BG;
-  tft.drawRGBBitmap(cx - w / 2, cy - h / 2, crowBuf, w, h);
+  for (int y = 0; y < h; y++) {
+    int py = oy + y; if (py < 0 || py >= CROW_PH) continue;
+    const uint8_t *row = &bmp[y * rb];
+    for (int x = 0; x < w; x++) {
+      int px = ox + x; if (px < 0 || px >= CROW_PW) continue;
+      if (pgm_read_byte(&row[x >> 3]) & (0x80 >> (x & 7))) crowBuf[py * CROW_PW + px] = C_PLUM;
+    }
+  }
+  tft.drawRGBBitmap(CROW_PX, CROW_PY, crowBuf, CROW_PW, CROW_PH);
+}
+
+// Back-compat wrapper: every screen draws the crow via the animated panel
+// (fixed at 58,92), so a full redraw shows the current animation frame.
+void drawCrow(int cx, int cy, uint8_t mood) { (void)cx; (void)cy; drawCrowPanel(mood, millis()); }
+
+// Which screens show the crow (so the loop knows when to animate it).
+bool fuScreenHasCrow(FUScreen s) {
+  switch (s) {
+    case S_MAIN: case S_SUB: case S_WIFI: case S_NFC: case S_IR: case S_BLE:
+    case S_SET: case S_ABOUT: case S_SCRIPT: case S_FILEMENU: case S_ACTION:
+    case S_CONFIRM: case S_LINK: return true;
+    default: return false;
+  }
+}
+
+// The mood the crow shows on the current screen (About/Confirm/Link = attitude).
+uint8_t fuCrowMood() {
+  if (fuScr == S_ABOUT || fuScr == S_CONFIRM || fuScr == S_LINK) return 3;
+  return fuMood;
+}
+
+// Screen border + a 3-crow corner accent (bottom-left, below the crow panel).
+void fuBorder(bool accent) {
+  tft.drawRoundRect(0, 0, 320, 170, 6, C_PLUM);
+  if (accent) for (int i = 0; i < 3; i++) tft.drawBitmap(14 + i * 12, 156, BIRD9, 9, 5, C_BLOOD);
 }
 
 void fuHeader(const char* title) {
@@ -1412,11 +1475,26 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.7");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.8");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
   tft.setCursor(118, 126); tft.print("link "); tft.print(cc);
+}
+
+// Shown the instant the app connects but hasn't linked: the big 6-digit code
+// to type into Flying Flocks' "LINK REQUIRED" box.
+void fuDrawLink() {
+  tft.fillScreen(C_BG); fuHeader("Link");
+  drawCrow(58, 92, 3);
+  tft.setTextColor(C_AMBER); tft.setTextSize(1);
+  tft.setCursor(118, 26); tft.print("Flying Flocks wants");
+  tft.setCursor(118, 40); tft.print("to link. Enter this:");
+  char cc[8]; sprintf(cc, "%06u", linkCode);
+  tft.setTextSize(3); tft.setTextColor(C_INK); tft.setCursor(126, 66); tft.print(cc);
+  tft.setTextSize(1); tft.setTextColor(C_DIM);
+  tft.setCursor(118, 108); tft.print("Fleet > tap Flocked Up");
+  tft.setCursor(118, 122); tft.print("press = browse menu");
 }
 
 void nestLoad(const String &path) {
@@ -1532,6 +1610,7 @@ void fuNestSelect() {
 
 void fuBack() {
   if (fuScr == S_ACTION) { fuStopAction(); fuScr = fuActionParent; fuDirty = true; return; }
+  if (fuScr == S_LINK)     { fuScr = S_MAIN; fuDirty = true; return; }
   if (fuScr == S_FILE)     { fuScr = S_FILEMENU; fuSel = 0; fuDirty = true; return; }
   if (fuScr == S_FILEMENU) { fuScr = S_NEST; fuDirty = true; return; }
   if (fuScr == S_STASH)    { fuScr = S_FILEMENU; fuSel = 2; fuDirty = true; return; }
@@ -1585,6 +1664,7 @@ void fuRender() {
     case S_BLE:   { const char* it[] = {"Scan devices"};  fuDrawList("Bluetooth", it, nullptr, 1, fuSel); } break;
     case S_SET:   fuDrawSettings(fuSel); break;
     case S_ABOUT: fuDrawAbout(); break;
+    case S_LINK:  fuDrawLink(); break;
     case S_NEST:  fuDrawNest(); break;
     case S_FILE:  fuDrawFile(); break;
     case S_FILEMENU: fuDrawFileMenu(fuSel); break;
@@ -1594,6 +1674,7 @@ void fuRender() {
     case S_CONFIRM: fuDrawConfirm(); break;
     default: break;
   }
+  if (fuScr != S_BOOT) fuBorder(fuScreenHasCrow(fuScr));
 }
 
 void fuRenderRows() {
@@ -1608,6 +1689,7 @@ void fuRenderRows() {
     case S_SCRIPT: fuDrawScripts(fuSel); break;
     default: break;
   }
+  if (fuScr != S_BOOT) fuBorder(fuScreenHasCrow(fuScr));
 }
 
 void fuHandleInput() {
@@ -1648,6 +1730,7 @@ void fuHandleInput() {
         else fuRunPendingLocal();
         break;
       case S_SET:  fuSettingsSelect(fuSel); break;
+      case S_LINK: fuScr = S_MAIN; fuSel = 0; fuDirty = true; break;
       case S_NEST: fuNestSelect(); break;
       case S_FILE: fuScr = S_FILEMENU; fuSel = 0; fuDirty = true; break;
       case S_FILEMENU: {
@@ -1822,6 +1905,13 @@ void loop() {
   if (fuDirty) { fuRender(); fuDirty = false; fuRowsDirty = false; lastDraw = millis(); }
   else if (fuRowsDirty) { fuRenderRows(); fuRowsDirty = false; }
   else if (fuScr == S_ACTION && millis() - lastDraw > 350) { fuDrawActionLog(); lastDraw = millis(); }
+
+  // ---- crow animation: re-blit just the crow panel at ~14fps on crow screens ----
+  static uint32_t lastAnim = 0;
+  if (!fuDirty && fuScreenHasCrow(fuScr) && millis() - lastAnim > 70) {
+    lastAnim = millis();
+    drawCrowPanel(fuCrowMood(), millis());
+  }
 
   static uint32_t lastStat = 0;
   if (millis() - lastStat > 2000) { lastStat = millis(); setStatus(op.c_str()); }

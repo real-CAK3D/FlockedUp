@@ -48,7 +48,9 @@ Feature backlog for the crow-themed T-Embed CC1101 Plus firmware.
 
 ## Crow mascot, themes & visuals
 - ✅ More scenes + per-screen contextual crows
-- ✅ Animated crow (idle bob/blink, scan, hit, sleep)
+- ✅ Animated crow — fluid pixel loop (idle breathing bob + wing-flap, scan flap, hit hop, flip) **(v0.8)**
+- ✅ Screen border + 3-crow corner accent **(v0.8)**
+- ⬜ Multi-frame hand-drawn sequences (drop more crow frames to deepen each loop)
 - ✅ Theme accent colors; LED shows (signal meter **(v0.5)**, pulse, rainbow)
 - ✅ Screensaver; day/night auto-theme
 
@@ -74,4 +76,4 @@ Feature backlog for the crow-themed T-Embed CC1101 Plus firmware.
 - ⛔ Jam/flood/noise — refused in the engine (federal offence, no own-network exception)
 
 ---
-Shipped: v0.1 crow UI · v0.2 BLE scan + OOK decode · v0.3 pixel-art mascot · v0.4 rotation/speed/sleep/settings · v0.5 Frequency Analyzer + LED signal meter · v0.6 Collections (Hoard) + 80 MHz UI · **v0.7 Scripts engine, capture replay, importer, on-device move**
+Shipped: v0.1 crow UI · v0.2 BLE scan + OOK decode · v0.3 pixel-art mascot · v0.4 rotation/speed/sleep/settings · v0.5 Frequency Analyzer + LED signal meter · v0.6 Collections (Hoard) + 80 MHz UI · v0.7 Scripts engine, capture replay, importer, on-device move · **v0.8 fluid animated crow + screen border + 3-crow accent**
