@@ -44,6 +44,8 @@
 #include <SD.h>
 #include <FS.h>
 #include "crow_sprites.h"
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 
 // Declared up here (before the first function) so Arduino's auto-generated
 // prototypes, which reference it, see the type.
@@ -182,6 +184,8 @@ struct FUSettings {
   uint8_t led     = 0;      // palette index
   uint8_t mascot  = 0;      // default mood 0..3
   bool    appLink = true;   // BLE advertising on
+  uint8_t rot     = 1;      // display rotation (1 normal, 3 flipped — both landscape)
+  uint8_t sleepMin = 0;     // auto-sleep after N minutes idle (0 = off)
 };
 FUSettings cfg;
 Preferences prefs;
@@ -210,6 +214,12 @@ uint8_t  fuMood = 0;               // 0 idle, 1 scan, 2 hit, 3 flip
 int      fuPendingAction = -1;
 String   fuActionTitle = "";
 String   fuFilePath = "";
+bool     fuFull = true;             // true = full redraw (chrome+crow); false = rows only
+bool     fuRowsDirty = false;       // selection moved: redraw just the list rows (fast)
+uint32_t fuLastInput = 0;           // for the auto-sleep timeout
+#define  SETTINGS_N 10
+const uint32_t SLEEP_OPTS[] = {0, 1, 2, 5, 10};
+const int      SLEEP_OPTS_N = 5;
 
 const char* MAIN_PLAIN[] = {"Sub-GHz","NFC / RFID","Infrared","Wi-Fi Recon","Bluetooth","SD Files","Settings","About"};
 const char* MAIN_PUN[]   = {"Caw-GHz","Peck","Flock Beam","Murder Scan","Scavenge","The Nest","Roost","The Murder"};
@@ -893,10 +903,13 @@ void loadCfg() {
   cfg.led     = prefs.getUChar("led", 0);
   cfg.mascot  = prefs.getUChar("mascot", 0);
   cfg.appLink = prefs.getBool("applink", true);
+  cfg.rot      = prefs.getUChar("rot", 1);
+  cfg.sleepMin = prefs.getUChar("sleepmin", 0);
   prefs.end();
   if (cfg.bright < 20) cfg.bright = 20;
   if (cfg.led >= LED_PAL_N) cfg.led = 0;
   if (cfg.mascot > 3) cfg.mascot = 0;
+  if (cfg.rot != 1 && cfg.rot != 3) cfg.rot = 1;
 }
 void saveCfg() {
   prefs.begin("flocked", false);
@@ -905,6 +918,8 @@ void saveCfg() {
   prefs.putUChar("led", cfg.led);
   prefs.putUChar("mascot", cfg.mascot);
   prefs.putBool("applink", cfg.appLink);
+  prefs.putUChar("rot", cfg.rot);
+  prefs.putUChar("sleepmin", cfg.sleepMin);
   prefs.end();
 }
 
@@ -929,9 +944,8 @@ void fuHeader(const char* title) {
 }
 
 void fuDrawList(const char* title, const char* const* plain, const char* const* pun, int n, int sel) {
-  tft.fillScreen(C_BG);
-  fuHeader(title);
-  drawCrow(58, 92, fuMood);
+  if (fuFull) { tft.fillScreen(C_BG); fuHeader(title); drawCrow(58, 92, fuMood); }
+  else        { tft.fillRect(112, 18, 208, 152, C_BG); }
   int x = 120, y = 22;
   for (int i = 0; i < n; i++) {
     const char* lbl = (cfg.puns && pun) ? pun[i] : plain[i];
@@ -955,6 +969,18 @@ void fuDrawAction() {
   if (fuLogN == 0) { tft.setTextColor(C_DIM); tft.setCursor(x, y); tft.print("listening..."); }
 }
 
+// Fast action-screen refresh: repaint only the live log (keeps the crow/header).
+void fuDrawActionLog() {
+  tft.fillRect(112, 18, 208, 128, C_BG);
+  int x = 120, y = 22;
+  for (int i = 0; i < fuLogN; i++) {
+    tft.setTextColor(i == 0 ? C_INK : C_DIM); tft.setCursor(x, y);
+    String s = fuLog[i]; if (s.length() > 33) s = s.substring(0, 33);
+    tft.print(s); y += 16;
+  }
+  if (fuLogN == 0) { tft.setTextColor(C_DIM); tft.setCursor(x, y); tft.print("listening..."); }
+}
+
 void fuDrawConfirm() {
   tft.fillScreen(C_BG); fuHeader("Authorize");
   drawCrow(58, 92, 3);
@@ -966,21 +992,25 @@ void fuDrawConfirm() {
 }
 
 void fuDrawSettings(int sel) {
-  tft.fillScreen(C_BG); fuHeader("Settings");
-  drawCrow(58, 92, fuMood);
-  char buf[7][30];
-  snprintf(buf[0], 30, "Crow puns: %s", cfg.puns ? "ON" : "off");
-  snprintf(buf[1], 30, "LED: %s", LED_NAME[cfg.led]);
-  snprintf(buf[2], 30, "Brightness: %d", cfg.bright);
-  snprintf(buf[3], 30, "Mascot mood: %d", cfg.mascot);
-  snprintf(buf[4], 30, "App link: %s", cfg.appLink ? "ON" : "off");
-  snprintf(buf[5], 30, "Regen link code");
-  snprintf(buf[6], 30, "Save & back");
-  int x = 120, y = 22;
-  for (int i = 0; i < 7; i++) {
-    if (i == sel) { tft.fillRoundRect(x-6, y-3, 200, 16, 4, C_PANEL); tft.drawRoundRect(x-6, y-3, 200, 16, 4, C_BLOOD); }
-    tft.setTextColor(i == sel ? C_INK : C_DIM); tft.setTextSize(1); tft.setCursor(x, y+1); tft.print(buf[i]);
-    y += 19;
+  if (fuFull) { tft.fillScreen(C_BG); fuHeader("Settings"); drawCrow(58, 92, fuMood); }
+  else        { tft.fillRect(112, 18, 208, 152, C_BG); }
+  char buf[SETTINGS_N][32];
+  snprintf(buf[0], 32, "Crow puns: %s", cfg.puns ? "ON" : "off");
+  snprintf(buf[1], 32, "LED colour: %s", LED_NAME[cfg.led]);
+  snprintf(buf[2], 32, "LED bright: %d", cfg.bright);
+  snprintf(buf[3], 32, "Mascot: %d", cfg.mascot);
+  snprintf(buf[4], 32, "Flip screen: %s", cfg.rot == 3 ? "ON" : "off");
+  if (cfg.sleepMin == 0) snprintf(buf[5], 32, "Sleep: off");
+  else                   snprintf(buf[5], 32, "Sleep: %um", cfg.sleepMin);
+  snprintf(buf[6], 32, "App link: %s", cfg.appLink ? "ON" : "off");
+  snprintf(buf[7], 32, "Regen link code");
+  snprintf(buf[8], 32, "Return to Launcher");
+  snprintf(buf[9], 32, "Save & back");
+  int x = 118, y = 20;
+  for (int i = 0; i < SETTINGS_N; i++) {
+    if (i == sel) { tft.fillRoundRect(x-6, y-2, 204, 13, 3, C_PANEL); tft.drawRoundRect(x-6, y-2, 204, 13, 3, C_BLOOD); }
+    tft.setTextColor(i == sel ? C_INK : C_DIM); tft.setTextSize(1); tft.setCursor(x, y); tft.print(buf[i]);
+    y += 14;
   }
 }
 
@@ -990,7 +1020,7 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.2");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.4");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
@@ -1012,10 +1042,14 @@ void nestLoad(const String &path) {
 }
 
 void fuDrawNest() {
-  tft.fillScreen(C_BG); fuHeader("The Nest");
+  if (fuFull) {
+    tft.fillScreen(C_BG); fuHeader("The Nest");
+    if (sdok) {
+      tft.setTextColor(C_DIM); tft.setTextSize(1); tft.setCursor(6, 20);
+      String p = nestPath; if (p.length() > 44) p = p.substring(p.length() - 44); tft.print(p);
+    }
+  } else { tft.fillRect(0, 34, 320, 134, C_BG); }
   if (!sdok) { tft.setTextColor(C_BLOOD); tft.setTextSize(2); tft.setCursor(60, 76); tft.print("No SD card"); return; }
-  tft.setTextColor(C_DIM); tft.setTextSize(1); tft.setCursor(6, 20);
-  String p = nestPath; if (p.length() > 44) p = p.substring(p.length() - 44); tft.print(p);
   int rows = 7, x = 6, y = 38;
   if (nestSel < nestTop) nestTop = nestSel;
   if (nestSel >= nestTop + rows) nestTop = nestSel - rows + 1;
@@ -1086,9 +1120,13 @@ void fuSettingsSelect(int i) {
     case 1: cfg.led = (cfg.led + 1) % LED_PAL_N; applyLed(); break;
     case 2: cfg.bright += 20; if (cfg.bright > 100) cfg.bright = 20; leds.setBrightness(cfg.bright); applyLed(); break;
     case 3: cfg.mascot = (cfg.mascot + 1) % 4; fuMood = cfg.mascot; break;
-    case 4: cfg.appLink = !cfg.appLink; if (cfg.appLink) BLEDevice::startAdvertising(); else BLEDevice::stopAdvertising(); break;
-    case 5: genLinkCode(); linked = false; break;
-    case 6: saveCfg(); fuEnter(S_MAIN); return;
+    case 4: cfg.rot = (cfg.rot == 1) ? 3 : 1; tft.setRotation(cfg.rot); break;
+    case 5: { int k = 0; while (k < SLEEP_OPTS_N && SLEEP_OPTS[k] != cfg.sleepMin) k++;
+              cfg.sleepMin = SLEEP_OPTS[(k + 1) % SLEEP_OPTS_N]; break; }
+    case 6: cfg.appLink = !cfg.appLink; if (cfg.appLink) BLEDevice::startAdvertising(); else BLEDevice::stopAdvertising(); break;
+    case 7: genLinkCode(); linked = false; break;
+    case 8: saveCfg(); returnToLauncher(); return;
+    case 9: saveCfg(); fuEnter(S_MAIN); return;
   }
   fuDirty = true;
 }
@@ -1122,7 +1160,27 @@ void fuBootSplash() {
   delay(700);
 }
 
+void drawSleep() {
+  tft.fillScreen(C_BG);
+  tft.drawBitmap((320 - CROW_SLEEP_W) / 2, 28, CROW_SLEEP, CROW_SLEEP_W, CROW_SLEEP_H, C_PLUM);
+  tft.setTextColor(C_AMBER); tft.setTextSize(1);
+  tft.setCursor(92, 138); tft.print("resting  \xB7  press to wake");
+}
+
+void enterSleep() {
+  drawSleep();
+  setLed(4, 0, 6); delay(500); setLed(0, 0, 0);
+  digitalWrite(TFT_BL, LOW);                               // backlight off
+  while (digitalRead(USER_KEY) == LOW) delay(10);          // wait for the button release
+  delay(60);
+  gpio_hold_en((gpio_num_t)BOARD_PWR_EN);                  // keep the board powered through deep sleep
+  gpio_deep_sleep_hold_en();
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_KEY, 0);   // wake when USER_KEY is pulled LOW
+  esp_deep_sleep_start();                                  // resets on wake -> fresh boot
+}
+
 void fuRender() {
+  fuFull = true;
   switch (fuScr) {
     case S_MAIN:  fuDrawList("menu",    MAIN_PLAIN, MAIN_PUN, MAIN_N, fuSel); break;
     case S_SUB:   fuDrawList("Sub-GHz", SUB_ITEMS,  nullptr,  SUB_N,  fuSel); break;
@@ -1140,19 +1198,33 @@ void fuRender() {
   }
 }
 
+void fuRenderRows() {
+  fuFull = false;
+  switch (fuScr) {
+    case S_MAIN:  fuDrawList("menu",    MAIN_PLAIN, MAIN_PUN, MAIN_N, fuSel); break;
+    case S_SUB:   fuDrawList("Sub-GHz", SUB_ITEMS,  nullptr,  SUB_N,  fuSel); break;
+    case S_WIFI:  fuDrawList("Wi-Fi",   WIFI_ITEMS, nullptr,  WIFI_N, fuSel); break;
+    case S_SET:   fuDrawSettings(fuSel); break;
+    case S_NEST:  fuDrawNest(); break;
+    default: break;
+  }
+}
+
 void fuHandleInput() {
   int8_t d = fuEnc();
   if (d != 0) {
+    fuLastInput = millis();
     switch (fuScr) {
-      case S_MAIN: fuSel = (fuSel + d + MAIN_N) % MAIN_N; fuDirty = true; break;
-      case S_SUB:  fuSel = (fuSel + d + SUB_N) % SUB_N;   fuDirty = true; break;
-      case S_WIFI: fuSel = (fuSel + d + WIFI_N) % WIFI_N; fuDirty = true; break;
-      case S_SET:  fuSel = (fuSel + d + 7) % 7;           fuDirty = true; break;
-      case S_NEST: if (nestN) { nestSel = (nestSel + d + nestN) % nestN; fuDirty = true; } break;
+      case S_MAIN: fuSel = (fuSel + d + MAIN_N) % MAIN_N; fuRowsDirty = true; break;
+      case S_SUB:  fuSel = (fuSel + d + SUB_N) % SUB_N;   fuRowsDirty = true; break;
+      case S_WIFI: fuSel = (fuSel + d + WIFI_N) % WIFI_N; fuRowsDirty = true; break;
+      case S_SET:  fuSel = (fuSel + d + SETTINGS_N) % SETTINGS_N; fuRowsDirty = true; break;
+      case S_NEST: if (nestN) { nestSel = (nestSel + d + nestN) % nestN; fuRowsDirty = true; } break;
       default: break;
     }
   }
   if (fuSelectPressed()) {
+    fuLastInput = millis();
     switch (fuScr) {
       case S_MAIN:
         if (MAIN_GOTO[fuSel] == S_NEST) { fuScr = S_NEST; nestLoad("/"); fuSel = 0; fuDirty = true; }
@@ -1181,6 +1253,7 @@ void setup() {
   loadCfg();
 
   pinMode(BOARD_PWR_EN, OUTPUT); digitalWrite(BOARD_PWR_EN, HIGH);  // keep board powered
+  gpio_hold_dis((gpio_num_t)BOARD_PWR_EN);                          // release any deep-sleep pin hold
   pinMode(RF_SW0, OUTPUT); pinMode(RF_SW1, OUTPUT);
   pinMode(ENC_A, INPUT_PULLUP); pinMode(ENC_B, INPUT_PULLUP);
   pinMode(ENC_KEY, INPUT_PULLUP); pinMode(USER_KEY, INPUT_PULLUP);
@@ -1193,7 +1266,8 @@ void setup() {
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, -1);
   pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
   tft.init(170, 320);
-  tft.setRotation(3);              // landscape 320x170 (crow UI)
+  tft.setRotation(cfg.rot);        // landscape 320x170 (1 normal / 3 flipped)
+  tft.setSPISpeed(40000000);       // 40 MHz display clock — fast redraws
   sdok = SD.begin(SD_CS, SPI, 10000000);
   Serial.println(sdok ? "[sd] mounted." : "[sd] no card.");
   fuBootSplash();
@@ -1238,7 +1312,7 @@ void setup() {
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
 
-  fuMood = cfg.mascot; fuScr = S_MAIN; fuDirty = true;
+  fuMood = cfg.mascot; fuScr = S_MAIN; fuDirty = true; fuLastInput = millis();
   Serial.println("[ble] advertising as \"" DEV_NAME "\" (service 4fafc201).");
 }
 
@@ -1254,15 +1328,18 @@ void loop() {
   // ---- crow UI input (encoder + select) ----
   fuHandleInput();
 
-  // USER_KEY (GPIO6): short press = back, hold ~1.2s = return to Launcher.
+  // USER_KEY (GPIO6): short press = back, hold ~3s = deep sleep (press to wake).
   static uint32_t ukDown = 0; static bool ukHandled = false;
   if (digitalRead(USER_KEY) == LOW) {
     if (ukDown == 0) { ukDown = millis(); ukHandled = false; }
-    else if (!ukHandled && millis() - ukDown > 1200) { ukHandled = true; returnToLauncher(); }
+    else if (!ukHandled && millis() - ukDown > 3000) { ukHandled = true; enterSleep(); }
   } else {
-    if (ukDown && !ukHandled) fuBack();
+    if (ukDown && !ukHandled) { fuBack(); fuLastInput = millis(); }
     ukDown = 0;
   }
+
+  // auto-sleep after the configured idle timeout (not while a job is running)
+  if (cfg.sleepMin > 0 && !uiActionActive && millis() - fuLastInput > (uint32_t)cfg.sleepMin * 60000UL) enterSleep();
 
 #if ALLOW_TX
   if (txPending) { txPending = false; doTransmit(txFreq, txBits); }
@@ -1300,8 +1377,9 @@ void loop() {
 
   // ---- render (redraw on change; action screen refreshes for live log) ----
   static uint32_t lastDraw = 0;
-  if (fuDirty) { fuRender(); fuDirty = false; lastDraw = millis(); }
-  else if (fuScr == S_ACTION && millis() - lastDraw > 350) { fuRender(); lastDraw = millis(); }
+  if (fuDirty) { fuRender(); fuDirty = false; fuRowsDirty = false; lastDraw = millis(); }
+  else if (fuRowsDirty) { fuRenderRows(); fuRowsDirty = false; }
+  else if (fuScr == S_ACTION && millis() - lastDraw > 350) { fuDrawActionLog(); lastDraw = millis(); }
 
   static uint32_t lastStat = 0;
   if (millis() - lastStat > 2000) { lastStat = millis(); setStatus(op.c_str()); }
