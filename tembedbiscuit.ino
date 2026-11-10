@@ -43,6 +43,7 @@
 #include <Preferences.h>
 #include <SD.h>
 #include <FS.h>
+#include "crow_sprites.h"
 
 // Declared up here (before the first function) so Arduino's auto-generated
 // prototypes, which reference it, see the type.
@@ -173,6 +174,7 @@ static const uint16_t C_DIM    = RGB565(112,112,124);
 static const uint16_t C_CROW   = RGB565(22,22,28);
 static const uint16_t C_CROWHI = RGB565(64,70,92);
 static const uint16_t C_EYE    = RGB565(246,200,44);
+static const uint16_t C_PLUM   = RGB565(178,75,255);   // #B24BFF — crow sprite colour
 
 struct FUSettings {
   bool    puns    = true;
@@ -906,24 +908,16 @@ void saveCfg() {
   prefs.end();
 }
 
-// --- procedural crow mascot (mood: 0 idle, 1 scan, 2 hit, 3 flip) ----------
+// --- crow mascot: embedded pixel sprite drawn in purple, centered at (cx,cy) --
 void drawCrow(int cx, int cy, uint8_t mood) {
-  tft.fillTriangle(cx-2, cy+6, cx-32, cy+2, cx-24, cy+24, C_CROW);     // tail
-  tft.fillRoundRect(cx-20, cy-12, 40, 42, 14, C_CROW);                 // body
-  tft.fillTriangle(cx-14, cy-4, cx+14, cy-8, cx+6, cy+18, C_CROWHI);   // wing sheen
-  tft.fillTriangle(cx-14, cy-4, cx+6, cy+18, cx-12, cy+16, C_CROW);
-  tft.fillCircle(cx+8, cy-16, 15, C_CROW);                             // head
-  int bl = (mood == 1 || mood == 2) ? 17 : 12;                        // beak (open on scan/hit)
-  tft.fillTriangle(cx+20, cy-20, cx+20+bl, cy-16, cx+20, cy-11, C_AMBER);
-  if (mood == 1 || mood == 2) tft.fillTriangle(cx+20, cy-14, cx+20+bl-4, cy-14, cx+20, cy-8, C_AMBER);
-  uint16_t eyec = (mood == 3) ? C_BLOOD : C_EYE;                       // eye
-  tft.fillCircle(cx+11, cy-18, 4, eyec);
-  tft.fillCircle(cx+12, cy-18, 2, C_BG);
-  if (mood == 0) tft.fillRect(cx+7, cy-22, 9, 2, C_CROW);              // calm lid
-  if (mood == 2) tft.drawCircle(cx+11, cy-18, 6, C_INK);              // hit: wide
-  tft.drawLine(cx-4, cy+28, cx-6, cy+36, C_AMBER);                     // legs
-  tft.drawLine(cx+4, cy+28, cx+6, cy+36, C_AMBER);
-  if (mood == 3) { tft.fillRoundRect(cx+16, cy-4, 5, 22, 2, C_CROWHI); tft.fillCircle(cx+18, cy-5, 3, C_INK); }
+  const uint8_t *bmp; int w, h;
+  switch (mood) {
+    case 1:  bmp = CROW_SCAN; w = CROW_SCAN_W; h = CROW_SCAN_H; break;
+    case 2:  bmp = CROW_HIT;  w = CROW_HIT_W;  h = CROW_HIT_H;  break;
+    case 3:  bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; break;
+    default: bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; break;
+  }
+  tft.drawBitmap(cx - w / 2, cy - h / 2, bmp, w, h, C_PLUM);
 }
 
 void fuHeader(const char* title) {
@@ -1120,12 +1114,12 @@ void fuBack() {
 
 void fuBootSplash() {
   tft.fillScreen(C_BG);
-  drawCrow(160, 66, 3);
-  tft.setTextSize(3); tft.setTextColor(C_BLOOD); tft.setCursor(66, 108); tft.print("FLOCKED UP");
-  tft.setTextSize(1); tft.setTextColor(C_AMBER); tft.setCursor(96, 140); tft.print("a murder of crows  \xB7  FTM");
-  for (int k = 0; k < 3; k++) { setLed(14, 0, 2); delay(110); setLed(0, 0, 0); delay(80); }
+  tft.drawBitmap((320 - CROW_LOGO_W) / 2, 36, CROW_LOGO, CROW_LOGO_W, CROW_LOGO_H, C_PLUM);
+  tft.setTextSize(1); tft.setTextColor(C_AMBER);
+  tft.setCursor(92, 36 + CROW_LOGO_H + 16); tft.print("a murder of crows  \xB7  FTM");
+  for (int k = 0; k < 3; k++) { setLed(12, 0, 16); delay(110); setLed(0, 0, 0); delay(80); }
   applyLed();
-  delay(650);
+  delay(700);
 }
 
 void fuRender() {
