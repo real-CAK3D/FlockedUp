@@ -204,6 +204,7 @@ bool    uiActionActive = false;    // an on-device action screen is running a jo
 volatile bool localActive = false; // a local job wants the radios to run (no host)
 bool    nfcPolling = false;
 volatile bool bleScanRun = false;
+volatile bool anaRun = false;        // frequency-analyzer sweep active
 BLEScan *pBLEScan = nullptr;
 
 FUScreen fuScr = S_BOOT;
@@ -225,8 +226,8 @@ const char* MAIN_PLAIN[] = {"Sub-GHz","NFC / RFID","Infrared","Wi-Fi Recon","Blu
 const char* MAIN_PUN[]   = {"Caw-GHz","Peck","Flock Beam","Murder Scan","Scavenge","The Nest","Roost","The Murder"};
 const FUScreen MAIN_GOTO[] = {S_SUB,S_NFC,S_IR,S_WIFI,S_BLE,S_NEST,S_SET,S_ABOUT};
 const int   MAIN_N = 8;
-const char* SUB_ITEMS[]  = {"Scan & Decode","RSSI Sweep"};
-const int   SUB_N = 2;
+const char* SUB_ITEMS[]  = {"Scan & Decode","RSSI Sweep","Analyzer"};
+const int   SUB_N = 3;
 const char* WIFI_ITEMS[] = {"AP Scan","Stations","Probes","Pkt Monitor","Deauth","Beacon Spam"};
 const int   WIFI_N = 6;
 
@@ -372,19 +373,55 @@ bool initCC1101() {
   return true;
 }
 
+// LED signal meter: map RSSI onto the 8 NeoPixels (green -> red, more lit = stronger).
+void ledSignal(int rssi) {
+  int lvl = map(constrain(rssi, -100, -40), -100, -40, 0, WS2812_N);
+  for (int i = 0; i < WS2812_N; i++) {
+    uint32_t c = 0;
+    if (i < lvl) c = leds.Color(map(i, 0, WS2812_N - 1, 0, 14), map(i, 0, WS2812_N - 1, 14, 0), 0);
+    leds.setPixelColor(i, c);
+  }
+  leds.show();
+}
+
 void subghzRssiSweep() {
   if (!cc1101ok) { cc1101ok = initCC1101(); if (!cc1101ok) return; }
   ELECHOUSE_cc1101.setCCMode(1);
   ELECHOUSE_cc1101.setModulation(0);
+  int peak = -128;
   for (int i = 0; i < SUBGHZ_N; i++) {
     setRfBand(SUBGHZ_FREQS[i]);
     ELECHOUSE_cc1101.setMHZ(SUBGHZ_FREQS[i]);
     ELECHOUSE_cc1101.SetRx();
     delay(60);
     int rssi = ELECHOUSE_cc1101.getRssi();
+    if (rssi > peak) peak = rssi;
     if (rssi > RF_ACTIVITY_DBM)
       notifyLine("DATA:RF:" + String(SUBGHZ_FREQS[i], 2) + "," + String(rssi) + "\n");
   }
+  ledSignal(peak);
+}
+
+// Frequency Analyzer: coarse-sweep the CC1101 bands and report the strongest frequency.
+void freqAnalyzer() {
+  if (!cc1101ok) { cc1101ok = initCC1101(); if (!cc1101ok) return; }
+  ELECHOUSE_cc1101.setCCMode(1);
+  ELECHOUSE_cc1101.setModulation(0);
+  static const float A0[3] = {300, 387, 779};
+  static const float A1[3] = {348, 464, 928};
+  float bestF = 0; int bestR = -128;
+  for (int b = 0; b < 3 && anaRun; b++) {
+    for (float f = A0[b]; f <= A1[b] && anaRun; f += 1.0f) {
+      setRfBand(f); ELECHOUSE_cc1101.setMHZ(f); ELECHOUSE_cc1101.SetRx();
+      delayMicroseconds(1200);
+      int r = ELECHOUSE_cc1101.getRssi();
+      if (r > bestR) { bestR = r; bestF = f; }
+    }
+  }
+  if (!anaRun) return;
+  ledSignal(bestR);
+  notifyLine("peak " + String(bestF, 2) + " MHz  " + String(bestR) + " dBm\n");
+  setRfBand(bestF); ELECHOUSE_cc1101.setMHZ(bestF); ELECHOUSE_cc1101.SetRx();  // park on the peak
 }
 
 static const uint32_t GAP_US = 5000;
@@ -775,7 +812,7 @@ void runBleScanPass() {
 void stopAll() {
   scanning = false; subScan = false;
   deauthRun = false; beaconRun = false;
-  bleScanRun = false;
+  bleScanRun = false; anaRun = false;
   stopSniffer();
   setStatus("idle");
   setLed(0, 0, 8);
@@ -1020,7 +1057,7 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.4");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.5");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
@@ -1085,8 +1122,8 @@ void fuStartAction(FUScreen from, int idx) {
   for (int i = 0; i < FU_LOGN; i++) fuLog[i] = ""; fuLogN = 0;
   uiActionActive = true; localActive = true; nfcPolling = false; fuMood = 1;
   if (from == S_SUB) {
-    fuActionTitle = (idx == 0) ? "Sub-GHz decode" : "RSSI sweep";
-    subScan = true; setStatus("subghz"); setLed(8, 4, 0);
+    if (idx == 2) { fuActionTitle = "Analyzer"; anaRun = true; setStatus("analyze"); }
+    else { fuActionTitle = (idx == 0) ? "Sub-GHz decode" : "RSSI sweep"; subScan = true; setStatus("subghz"); setLed(8, 4, 0); }
   } else if (from == S_NFC) {
     fuActionTitle = "NFC read"; nfcPolling = true; setStatus("nfc"); setLed(0, 8, 8);
   } else if (from == S_IR) {
@@ -1371,6 +1408,8 @@ void loop() {
     sendBeaconBurst(); delay(50);
   } else if (host && bleScanRun) {
     runBleScanPass();
+  } else if (host && anaRun) {
+    freqAnalyzer(); delay(120);
   } else {
     delay(16);
   }
