@@ -248,6 +248,14 @@ String   fuFilePath = "";
 bool     fuFull = true;             // true = full redraw (chrome+crow); false = rows only
 bool     fuRowsDirty = false;       // selection moved: redraw just the list rows (fast)
 uint32_t fuLastInput = 0;           // for the auto-sleep timeout
+
+// --- Remote control / screen-mirror (the app drives the UI as if it were the device) ---
+volatile int8_t uiNavDelta  = 0;    // encoder ticks from the app (CMD:ui:up/down)
+volatile bool   uiSelPress  = false; // select press from the app (CMD:ui:sel)
+volatile bool   uiBackPress = false; // back press from the app (CMD:ui:back)
+int8_t          uiPickIndex = -1;    // tap a menu row in the app → jump+activate (CMD:ui:pick:N)
+uint32_t        lastUIEmit  = 0;     // throttle DATA:UI emission
+bool            uiDirty     = true;  // screen changed → push a fresh DATA:UI frame
 #define  SETTINGS_N 10
 const uint32_t SLEEP_OPTS[] = {0, 1, 2, 5, 10};
 const int      SLEEP_OPTS_N = 5;
@@ -390,6 +398,109 @@ void emitHealth() {
   h += String(readBatteryPct());   // battery % or -1 (unknown)
   h += "\n";
   notifyLine(h);
+}
+
+// ---- Screen mirror: a compact model of the current screen so the app can render
+//      a live T-Embed replica and drive it (CMD:ui:up/down/sel/back/pick). --------
+String jesc(const String &s) {
+  String o; o.reserve(s.length() + 4);
+  for (size_t i = 0; i < s.length(); i++) { char c = s[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if ((uint8_t)c < 0x20) o += ' ';
+    else o += c;
+  }
+  return o;
+}
+const char *uiScreenTag(FUScreen s) {
+  switch (s) {
+    case S_MAIN: return "MAIN"; case S_SUB: return "SUB"; case S_NFC: return "NFC";
+    case S_IR: return "IR"; case S_WIFI: return "WIFI"; case S_BLE: return "BLE";
+    case S_NEST: return "NEST"; case S_COLL: return "COLL"; case S_FILE: return "FILE";
+    case S_FILEMENU: return "FILEMENU"; case S_STASH: return "STASH"; case S_SCRIPT: return "SCRIPT";
+    case S_SET: return "SET"; case S_ABOUT: return "ABOUT"; case S_LINK: return "LINK";
+    case S_ACTION: return "ACTION"; case S_CONFIRM: return "CONFIRM"; case S_TUNE: return "TUNE";
+    default: return "BOOT";
+  }
+}
+String uiSetLabel(int i) {
+  char b[32];
+  switch (i) {
+    case 0: snprintf(b, 32, "Crow puns: %s", cfg.puns ? "ON" : "off"); break;
+    case 1: snprintf(b, 32, "LED colour: %s", LED_NAME[cfg.led]); break;
+    case 2: snprintf(b, 32, "LED bright: %d", cfg.bright); break;
+    case 3: snprintf(b, 32, "Mascot: %d", cfg.mascot); break;
+    case 4: snprintf(b, 32, "Flip screen: %s", cfg.rot == 3 ? "ON" : "off"); break;
+    case 5: if (cfg.sleepMin == 0) snprintf(b, 32, "Sleep: off"); else snprintf(b, 32, "Sleep: %um", cfg.sleepMin); break;
+    case 6: snprintf(b, 32, "App link: %s", cfg.appLink ? "ON" : "off"); break;
+    case 7: snprintf(b, 32, "Regen link code"); break;
+    case 8: snprintf(b, 32, "Return to Launcher"); break;
+    default: snprintf(b, 32, "Save & back"); break;
+  }
+  return String(b);
+}
+int uiRowCount(FUScreen s) {
+  switch (s) {
+    case S_MAIN: return MAIN_N; case S_SUB: return SUB_N; case S_WIFI: return WIFI_N;
+    case S_NFC: case S_IR: case S_BLE: return 1; case S_FILEMENU: return 4;
+    case S_SET: return SETTINGS_N; case S_SCRIPT: return scriptN + 1; case S_STASH: return stashN + 1;
+    case S_NEST: return nestN; default: return 0;
+  }
+}
+String uiRowLabel(FUScreen s, int i) {
+  switch (s) {
+    case S_MAIN: return (cfg.puns ? MAIN_PUN : MAIN_PLAIN)[i];
+    case S_SUB:  return SUB_ITEMS[i];
+    case S_WIFI: return WIFI_ITEMS[i];
+    case S_NFC:  return "Read tag";
+    case S_IR:   return "Sniff / learn";
+    case S_BLE:  return "Scan devices";
+    case S_FILEMENU: { const char *it[] = {"View", "Play", "Copy to stash", "Back"}; return it[i]; }
+    case S_SET:  return uiSetLabel(i);
+    case S_SCRIPT: return (i == 0) ? String("[ Import ]") : scriptNames[i - 1];
+    case S_STASH:  return (i == 0) ? String("[ + New stash ]") : ("[" + stashNames[i - 1] + "]");
+    case S_NEST:   { String nm = nestNames[i]; return nestIsDir[i] ? ("[" + nm + "]") : nm; }
+    default: return "";
+  }
+}
+void emitUI() {
+  if (!cfg.appLink) return;
+  if (!(connected || serialActive)) return;
+  int sel = (fuScr == S_NEST) ? nestSel : fuSel;
+  int total = uiRowCount(fuScr);
+  const int WIN = 12;                 // windowed so the BLE line stays small
+  int off = 0;
+  if (total > WIN) { off = sel - WIN / 2; if (off < 0) off = 0; if (off > total - WIN) off = total - WIN; }
+  int end = (total < off + WIN) ? total : off + WIN;
+
+  String j = "DATA:UI:{\"s\":\""; j += uiScreenTag(fuScr);
+  j += "\",\"i\":"; j += String(sel);
+  j += ",\"m\":"; j += String(fuCrowMood());
+  j += ",\"link\":\""; j += (linked ? "ok" : (connected ? "wait" : "off")); j += "\"";
+  // title
+  const char *title = "";
+  switch (fuScr) {
+    case S_MAIN: title = "MENU"; break; case S_SUB: title = "Sub-GHz"; break;
+    case S_WIFI: title = "Wi-Fi"; break; case S_NFC: title = "NFC"; break;
+    case S_IR: title = "Infrared"; break; case S_BLE: title = "Bluetooth"; break;
+    case S_SET: title = "Settings"; break; case S_SCRIPT: title = "Scripts"; break;
+    case S_NEST: title = "The Nest"; break; case S_STASH: title = "Copy to stash"; break;
+    case S_FILEMENU: title = "File"; break; case S_ABOUT: title = "About"; break;
+    case S_LINK: title = "Link"; break; case S_TUNE: title = "Free Tune"; break;
+    case S_CONFIRM: title = "Authorize"; break; case S_ACTION: title = fuActionTitle.c_str(); break;
+    default: break;
+  }
+  j += ",\"t\":\""; j += jesc(title); j += "\"";
+  j += ",\"n\":"; j += String(total);
+  j += ",\"o\":"; j += String(off);
+  j += ",\"r\":[";
+  for (int i = off; i < end; i++) { if (i > off) j += ","; j += "\"" + jesc(uiRowLabel(fuScr, i)) + "\""; }
+  j += "]";
+  // specials
+  if (fuScr == S_LINK || fuScr == S_ABOUT) { char cc[8]; sprintf(cc, "%06u", linkCode); j += ",\"code\":\""; j += cc; j += "\""; }
+  if (fuScr == S_TUNE) { j += ",\"f\":" + String(tuneF, 2) + ",\"rssi\":" + String(tuneRssi) + ",\"step\":" + String(TUNE_STEPS[tuneStepIdx], 2); }
+  if (fuScr == S_ACTION) { j += ",\"log\":["; for (int i = 0; i < fuLogN; i++) { if (i) j += ","; j += "\"" + jesc(fuLog[i]) + "\""; } j += "]"; }
+  j += "}\n";
+  notifyLine(j);
 }
 
 const char *authStr(wifi_auth_mode_t a) {
@@ -1150,6 +1261,14 @@ void handleCommand(String v) {
   if (v.startsWith("CMD:scriptlist") || v.startsWith("CMD:script:list")) { listPending = true; return; }
   if (v.startsWith("CMD:script:run:")) { scriptRunPath = v.substring(15); scriptRunPath.trim(); scriptRunPending = true; notifyLine("DATA:MODE:script,start\n"); return; }
 
+  // ---- Remote control / screen mirror: drive the crow UI from the app ----
+  if (v.startsWith("CMD:ui:pick:")) { uiPickIndex = (int8_t)v.substring(12).toInt(); fuLastInput = millis(); return; }
+  if (v.startsWith("CMD:ui:up"))   { uiNavDelta--; fuLastInput = millis(); return; }
+  if (v.startsWith("CMD:ui:down")) { uiNavDelta++; fuLastInput = millis(); return; }
+  if (v.startsWith("CMD:ui:sel"))  { uiSelPress  = true; fuLastInput = millis(); return; }
+  if (v.startsWith("CMD:ui:back")) { uiBackPress = true; fuLastInput = millis(); return; }
+  if (v.startsWith("CMD:ui:sync")) { uiDirty = true; return; }   // app asks for a fresh screen frame
+
   // Generic wardrive sweep (main DATA:AP feed).
   if (v.startsWith("CMD:scan") || v.startsWith("CMD:sniff") || v.startsWith("CMD:aplist")) {
     subScan=false; stopSniffer(); scanning = true; setStatus("wardrive"); setLed(0,10,0); return;
@@ -1730,7 +1849,7 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.11");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.12");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
@@ -1953,7 +2072,15 @@ void fuRenderRows() {
 }
 
 void fuHandleInput() {
+  // Fold the app's remote input in with the hardware encoder/button.
+  if (uiPickIndex >= 0) {                 // tapped a menu row in the app → jump + activate
+    int tot = uiRowCount(fuScr);
+    int idx = uiPickIndex; if (tot > 0 && idx > tot - 1) idx = tot - 1;
+    if (fuScr == S_NEST) nestSel = idx; else fuSel = idx;
+    uiPickIndex = -1; uiSelPress = true; fuDirty = true;
+  }
   int8_t d = fuEnc();
+  if (uiNavDelta) { d += uiNavDelta; uiNavDelta = 0; }
   if (d != 0) {
     fuLastInput = millis();
     switch (fuScr) {
@@ -1971,7 +2098,8 @@ void fuHandleInput() {
       default: break;
     }
   }
-  if (fuSelectPressed()) {
+  bool selNow = fuSelectPressed() || uiSelPress; uiSelPress = false;
+  if (selNow) {
     fuLastInput = millis();
     switch (fuScr) {
       case S_MAIN:
@@ -2133,6 +2261,7 @@ void loop() {
     if (ukDown && !ukHandled) { fuBack(); fuLastInput = millis(); }
     ukDown = 0;
   }
+  if (uiBackPress) { uiBackPress = false; fuBack(); fuLastInput = millis(); }  // remote back
 
   // auto-sleep after the configured idle timeout (not while a job is running)
   if (cfg.sleepMin > 0 && !uiActionActive && millis() - fuLastInput > (uint32_t)cfg.sleepMin * 60000UL) enterSleep();
@@ -2182,9 +2311,9 @@ void loop() {
 
   // ---- render (redraw on change; action screen refreshes for live log) ----
   static uint32_t lastDraw = 0;
-  if (fuDirty) { fuRender(); fuDirty = false; fuRowsDirty = false; lastDraw = millis(); }
-  else if (fuRowsDirty) { fuRenderRows(); fuRowsDirty = false; }
-  else if (fuScr == S_ACTION && millis() - lastDraw > 350) { fuDrawActionLog(); lastDraw = millis(); }
+  if (fuDirty) { fuRender(); fuDirty = false; fuRowsDirty = false; lastDraw = millis(); uiDirty = true; }
+  else if (fuRowsDirty) { fuRenderRows(); fuRowsDirty = false; uiDirty = true; }
+  else if (fuScr == S_ACTION && millis() - lastDraw > 350) { fuDrawActionLog(); lastDraw = millis(); uiDirty = true; }
 
   // ---- crow animation: re-blit just the crow panel at ~14fps on crow screens ----
   static uint32_t lastAnim = 0;
@@ -2197,6 +2326,14 @@ void loop() {
   if (fuScr == S_TUNE && tuneActive) {
     static uint32_t lastTune = 0;
     if (millis() - lastTune > 140) { lastTune = millis(); tuneServiceStep(); }
+  }
+
+  // ---- screen mirror: push the current screen model to the app ----
+  if (connected || serialActive) {
+    bool live = (fuScr == S_ACTION || fuScr == S_TUNE);
+    if ((uiDirty || (live && millis() - lastUIEmit > 300)) && millis() - lastUIEmit > 60) {
+      lastUIEmit = millis(); uiDirty = false; emitUI();
+    }
   }
 
   static uint32_t lastStat = 0;
