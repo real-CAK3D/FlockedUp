@@ -1502,42 +1502,20 @@ static const uint8_t BIRD9[] PROGMEM = { 0x80,0x80, 0x63,0x00, 0x3E,0x00, 0x1C,0
 
 // Compose background + the current animation frame of the crow and blit once.
 void drawCrowPanel(uint8_t mood, uint32_t ms) {
-  const uint8_t *bmp; int w, h; int dy = 0, dx = 0;
-  uint32_t ph = ms / 90;                       // ~11 logical fps
-  static const int8_t BOB[8]  = {0, -1, -2, -2, -1, 0, 0, 1};   // breathing bob
-  static const int8_t SWAY[8] = {0, 1, 2, 2, 1, 0, -1, -2};     // lazy side-to-side
+  // ONE stable sprite per mood — no rapid frame-swapping between different-sized
+  // sprites (that read as a glitch) and no sway. Only a slow, gentle breathing
+  // bob moves it. A real frame-by-frame animation engine replaces this next.
+  const uint8_t *bmp = CROW_IDLE; int w = CROW_IDLE_W, h = CROW_IDLE_H;
   switch (mood) {
-    case 1:  // scan — alert head + wing flap, sweeping side to side
-      dx = SWAY[(ms / 140) & 7];
-      if (ph & 1) { bmp = CROW_SCAN; w = CROW_SCAN_W; h = CROW_SCAN_H; dy = -2; }
-      else        { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
-      break;
-    case 2:  // hit — triumphant hop
-      bmp = CROW_HIT; w = CROW_HIT_W; h = CROW_HIT_H;
-      dy = (ph % 4 < 2) ? -3 : 0;
-      break;
-    case 3:  // flip — flipping off, wing alternating fast
-      if (ph & 1) { bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; dy = -1; }
-      else        { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
-      break;
-    default: { // idle — a living 8s loop: breathe + sway, glance twice, double-flap
-      uint32_t t = ms % 8000;
-      dy = BOB[ph & 7];
-      dx = SWAY[(ms / 220) & 7];
-      if (t < 300 || (t >= 3000 && t < 3280)) {        // two quick glances
-        bmp = CROW_SCAN; w = CROW_SCAN_W; h = CROW_SCAN_H; dy -= 1;
-      } else if (t >= 4400 && t < 4700) {              // a little preen/peck down
-        bmp = CROW_HIT; w = CROW_HIT_W; h = CROW_HIT_H; dy += 1;
-      } else if (t >= 6000 && t < 6500) {              // a little double wing-flap
-        if (ph & 1) { bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; dy -= 2; }
-        else        { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
-      } else {
-        bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H;
-      }
-    } break;
+    case 1: bmp = CROW_SCAN; w = CROW_SCAN_W; h = CROW_SCAN_H; break;  // scanning
+    case 2: bmp = CROW_HIT;  w = CROW_HIT_W;  h = CROW_HIT_H;  break;  // got one
+    case 3: bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; break;  // FTM
+    default: break;                                                    // idle
   }
+  static const int8_t BOB[8] = {0, 0, 1, 1, 1, 0, 0, -1};             // slow breathing
+  int dy = BOB[(ms / 260) & 7];
   for (int i = 0; i < CROW_PW * CROW_PH; i++) crowBuf[i] = C_BG;
-  int ox = (58 - CROW_PX) - w / 2 + dx;
+  int ox = (58 - CROW_PX) - w / 2;
   int oy = (92 - CROW_PY) - h / 2 + dy;
   int rb = (w + 7) / 8;
   for (int y = 0; y < h; y++) {
@@ -1586,15 +1564,24 @@ void fuHeader(const char* title) {
 }
 
 void fuDrawList(const char* title, const char* const* plain, const char* const* pun, int n, int sel) {
+  // Scrolling window: keep the selected row visible and show up/down hints so the
+  // last item is always reachable (the main menu has more rows than fit).
+  const int ROWS = 9;
+  int top = 0;
+  if (n > ROWS) { top = sel - ROWS / 2; if (top < 0) top = 0; if (top > n - ROWS) top = n - ROWS; }
+  int last = top + ROWS; if (last > n) last = n;
   if (fuFull) { tft.fillScreen(C_BG); fuHeader(title); drawCrow(58, 92, fuMood); }
   else        { tft.fillRect(112, 18, 208, 152, C_BG); }
   int x = 120, y = 20;
-  for (int i = 0; i < n; i++) {
+  for (int i = top; i < last; i++) {
     const char* lbl = (cfg.puns && pun) ? pun[i] : plain[i];
-    if (i == sel) { tft.fillRoundRect(x-6, y-2, 200, 14, 3, C_PANEL); tft.drawRoundRect(x-6, y-2, 200, 14, 3, C_BLOOD); }
+    if (i == sel) { tft.fillRoundRect(x-6, y-2, 196, 14, 3, C_PANEL); tft.drawRoundRect(x-6, y-2, 196, 14, 3, C_BLOOD); }
     tft.setTextColor(i == sel ? C_INK : C_DIM); tft.setTextSize(1); tft.setCursor(x, y); tft.print(lbl);
     y += 16;
   }
+  tft.setTextSize(1); tft.setTextColor(C_AMBER);
+  if (top > 0)    { tft.setCursor(306, 20);  tft.print("\x1E"); }   // ▲ more above
+  if (last < n)   { tft.setCursor(306, 150); tft.print("\x1F"); }   // ▼ more below
 }
 
 void fuDrawAction() {
@@ -1743,7 +1730,7 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.10");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.11");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
