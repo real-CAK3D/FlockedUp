@@ -46,10 +46,27 @@
 #include "crow_sprites.h"
 #include <esp_sleep.h>
 #include <driver/gpio.h>
+#include <HTTPClient.h>        // Wi-Fi "Online": weather fetch
+#include <WiFiClientSecure.h>  // Wi-Fi "Online": TLS for open-meteo
+#include <time.h>              // Wi-Fi "Online": NTP clock
+
+// BadUSB / HID: the ESP32-S3 native USB can act as a keyboard. This needs the
+// board built in USB-OTG (TinyUSB) mode — in the default Hardware-CDC mode the
+// TinyUSB HID classes don't exist, so we compile it out and report it disabled.
+// To use BadUSB: Tools → USB Mode → "USB-OTG (TinyUSB)", then reflash.
+#define ENABLE_BADUSB 1
+#if ENABLE_BADUSB && defined(ARDUINO_USB_MODE) && (ARDUINO_USB_MODE == 0)
+  #define BADUSB_ACTIVE 1
+  #include <USB.h>
+  #include <USBHIDKeyboard.h>
+  USBHIDKeyboard HidKbd;
+#else
+  #define BADUSB_ACTIVE 0
+#endif
 
 // Declared up here (before the first function) so Arduino's auto-generated
 // prototypes, which reference it, see the type.
-enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_COLL, S_FILE, S_FILEMENU, S_STASH, S_SCRIPT, S_SET, S_ABOUT, S_LINK, S_ACTION, S_CONFIRM };
+enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_COLL, S_FILE, S_FILEMENU, S_STASH, S_SCRIPT, S_SET, S_ABOUT, S_LINK, S_ACTION, S_CONFIRM, S_TUNE };
 
 // ---- Biscuit GATT contract (matches the app's BiscuitGatt, verified) --------
 #define SVC_UUID  "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -89,6 +106,12 @@ enum FUScreen { S_BOOT, S_MAIN, S_SUB, S_NFC, S_IR, S_WIFI, S_BLE, S_NEST, S_COL
 #define ENC_B   5
 #define ENC_KEY 0
 #define USER_KEY 6
+
+// Battery ADC pin — UNKNOWN/unconfirmed on this board, so left disabled (-1):
+// readBatteryPct() then reports -1 ("unknown") instead of a bogus reading. Set
+// this to the real BAT-sense GPIO once confirmed and battery % lights up fleet-wide.
+#define BAT_ADC_PIN -1
+#define BAT_DIV 2.0f       // on-board divider ratio (typical 2:1) once a pin is set
 
 // ---- sub-GHz config (same bands as c5biscuit) ------------------------------
 const float SUBGHZ_FREQS[] = {315.00f, 433.92f, 868.00f, 915.00f};
@@ -246,10 +269,22 @@ int      stashN = 0, stashTop = 0;
 uint8_t  fuConfirmKind = 0;          // 0 = Wi-Fi offensive, 1 = run .fu, 2 = play .sub, 3 = play .ir
 String   fuPendingPath = "";
 FUScreen fuConfirmReturn = S_WIFI;   // where Back/Cancel from the confirm screen goes
-const char* SUB_ITEMS[]  = {"Scan & Decode","RSSI Sweep","Analyzer","Waterfall"};
-const int   SUB_N = 4;
-const char* WIFI_ITEMS[] = {"AP Scan","Stations","Probes","Pkt Monitor","Deauth","Beacon Spam"};
-const int   WIFI_N = 6;
+const char* SUB_ITEMS[]  = {"Scan & Decode","RSSI Sweep","Analyzer","Waterfall","Full Band","Free Tune"};
+const int   SUB_N = 6;
+const int   SUB_TUNE_IDX = 5;    // "Free Tune" opens the interactive dial, not an action
+const char* WIFI_ITEMS[] = {"AP Scan","Stations","Probes","Pkt Monitor","Deauth","Beacon Spam","Clock & Weather"};
+const int   WIFI_N = 7;
+const int   WIFI_ONLINE_IDX = 6; // non-offensive, so it skips the TX-authorize screen
+
+// Free-tune dial (S_TUNE) state.
+const float TUNE_STEPS[] = {0.01f, 0.05f, 0.25f, 1.0f};
+const int   TUNE_STEP_N = 4;
+float   tuneF = 433.92f;
+uint8_t tuneStepIdx = 1;
+int     tuneRssi = -128;
+bool    tuneActive = false;
+uint8_t wfMode = 0;              // 0 = 433 waterfall, 1 = full-band sweep
+bool    onlinePending = false;   // deferred Wi-Fi clock/weather fetch
 
 // SD browser state
 String  nestPath = "/";
@@ -309,13 +344,24 @@ void notifyLine(const String &line) {
   if (uiActionActive) fuPushLog(line);
 }
 
+// Battery percent, or -1 when the BAT-sense pin isn't configured (don't fake it).
+int readBatteryPct() {
+  if (BAT_ADC_PIN < 0) return -1;
+  uint32_t mv = analogReadMilliVolts(BAT_ADC_PIN) * (uint32_t)BAT_DIV;
+  // LiPo 3.30 V (0%) .. 4.20 V (100%).
+  int pct = (int)((mv - 3300) * 100 / (4200 - 3300));
+  return pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+}
+
 void setStatus(const char *o) {
   op = o;
   if (statChar) {
     // Richer per-board health so the app can tell whether a board is working:
     // live heap (memory-leak/health), uptime (crash/reboot detection), and the
     // state of each radio/peripheral (sd/cc1101/nfc) plus the link gate.
-    String j = "{\"status\":0,\"battery\":100,\"op\":\"";
+    String j = "{\"status\":0,\"battery\":";
+    j += String(readBatteryPct());
+    j += ",\"op\":\"";
     j += o; j += "\",\"heap\":"; j += String(ESP.getFreeHeap());
     j += ",\"uptime\":"; j += String(millis() / 1000);
     j += ",\"sd\":"; j += (sdok ? 1 : 0);
@@ -331,7 +377,7 @@ void setStatus(const char *o) {
 // Live health heartbeat. Streams the same per-board telemetry as a DATA line so
 // it flows over BLE *and* USB-CDC through the normal pipeline (no new GATT): the
 // app parses it into the Fleet Health view, and it's readable on a USB terminal.
-//   DATA:HEALTH:<heapFree>,<uptimeSec>,<sd>,<cc1101>,<nfc>,<link>
+//   DATA:HEALTH:<heapFree>,<uptimeSec>,<sd>,<cc1101>,<nfc>,<link>,<batt>
 void emitHealth() {
   String h = "DATA:HEALTH:";
   h += String(ESP.getFreeHeap()); h += ",";
@@ -340,6 +386,8 @@ void emitHealth() {
   h += (cc1101ok ? "1" : "0");   h += ",";
   h += (nfcok ? "1" : "0");      h += ",";
   h += (linked ? "ok" : (connected ? "wait" : "off"));
+  h += ",";
+  h += String(readBatteryPct());   // battery % or -1 (unknown)
   h += "\n";
   notifyLine(h);
 }
@@ -474,13 +522,16 @@ void waterfall() {
   if (!cc1101ok) { cc1101ok = initCC1101(); if (!cc1101ok) return; }
   ELECHOUSE_cc1101.setCCMode(1);
   ELECHOUSE_cc1101.setModulation(0);
-  const float F0 = 433.0f, STEP = 0.05f;
-  const int   N  = 40;                 // 433.00 .. 434.95 MHz
+  // mode 0 = fine 433 ISM detail; mode 1 = coarse full-band (300..928 MHz).
+  const float F0   = (wfMode == 1) ? 300.0f : 433.0f;
+  const float STEP = (wfMode == 1) ? 9.97f  : 0.05f;
+  const int   N    = (wfMode == 1) ? 64     : 40;
   setRfBand(F0);
   float bestF = F0; int bestR = -128;
   String csv; csv.reserve(220);
   for (int i = 0; i < N && wfRun; i++) {
     float f = F0 + STEP * i;
+    if (wfMode == 1) setRfBand(f);    // flip the antenna band-select as we cross bands
     ELECHOUSE_cc1101.setMHZ(f);
     ELECHOUSE_cc1101.SetRx();
     delayMicroseconds(900);
@@ -493,6 +544,157 @@ void waterfall() {
   ledSignal(bestR);
   notifyLine("DATA:SPECTRUM:" + String(F0, 2) + "," + String(STEP, 2) + "," + String(N) + "," + csv + "\n");
   notifyLine("peak " + String(bestF, 2) + " MHz  " + String(bestR) + " dBm\n");
+}
+
+// --- Free-tune dial (S_TUNE) ------------------------------------------------
+void fuDrawTuneBar() {
+  tft.fillRect(16, 98, 290, 30, C_BG);
+  int r = tuneRssi;                                  // ~ -110 .. -20 dBm
+  float frac = (r + 110) / 90.0f; if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+  tft.drawRect(18, 100, 282, 14, C_DIM);
+  uint16_t col = (r > -55) ? C_BLOOD : (r > -80 ? C_AMBER : C_PLUM);
+  tft.fillRect(20, 102, (int)(frac * 278), 10, col);
+  tft.setTextColor(C_INK); tft.setTextSize(1); tft.setCursor(18, 118);
+  tft.print(r); tft.print(" dBm");
+}
+
+void fuDrawTune() {
+  tft.fillScreen(C_BG); fuHeader("Free Tune");
+  tft.setTextColor(C_INK); tft.setTextSize(3);
+  tft.setCursor(18, 36); tft.print(tuneF, 2);
+  tft.setTextSize(1); tft.setCursor(220, 52); tft.print("MHz");
+  tft.setTextColor(C_DIM); tft.setCursor(18, 78);
+  tft.print("step "); tft.print(TUNE_STEPS[tuneStepIdx], 2); tft.print(" MHz");
+  tft.setTextColor(C_AMBER); tft.setCursor(18, 150);
+  tft.print("turn=tune  press=step  back=exit");
+  fuDrawTuneBar();
+}
+
+// Live RSSI read for the tune dial (called from loop while S_TUNE is up).
+void tuneServiceStep() {
+  if (!cc1101ok) { cc1101ok = initCC1101(); if (!cc1101ok) return; }
+  ELECHOUSE_cc1101.setCCMode(1);
+  ELECHOUSE_cc1101.setModulation(0);
+  setRfBand(tuneF);
+  ELECHOUSE_cc1101.setMHZ(tuneF);
+  ELECHOUSE_cc1101.SetRx();
+  delay(3);
+  tuneRssi = ELECHOUSE_cc1101.getRssi();
+  ledSignal(tuneRssi);
+  fuDrawTuneBar();
+}
+
+// --- Wi-Fi "Online": NTP clock + current weather ----------------------------
+// Creds from SD /flockedup/wifi.txt: line1 ssid, line2 pass, line3 "lat,lon".
+void doOnline() {
+  if (!sdok) { notifyLine("no SD for wifi.txt\n"); return; }
+  File f = SD.open("/flockedup/wifi.txt");
+  if (!f) { notifyLine("add /flockedup/wifi.txt (ssid,pass,lat,lon)\n"); return; }
+  String ssid = f.readStringUntil('\n'); ssid.trim();
+  String pass = f.readStringUntil('\n'); pass.trim();
+  String loc  = f.readStringUntil('\n'); loc.trim();
+  f.close();
+  if (!ssid.length()) { notifyLine("wifi.txt: no ssid\n"); return; }
+
+  notifyLine("joining " + ssid + "...\n");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(200);
+  if (WiFi.status() != WL_CONNECTED) { notifyLine("wifi failed\n"); WiFi.disconnect(true); WiFi.mode(WIFI_OFF); return; }
+  notifyLine("ip " + WiFi.localIP().toString() + "\n");
+
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm ti;
+  if (getLocalTime(&ti, 8000)) {
+    char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M UTC", &ti);
+    notifyLine(String("time ") + buf + "\n");
+    notifyLine("DATA:TIME:" + String((long)time(nullptr)) + "\n");
+  } else notifyLine("ntp failed\n");
+
+  float lat = 40.71f, lon = -74.01f;
+  int comma = loc.indexOf(',');
+  if (comma > 0) { lat = loc.substring(0, comma).toFloat(); lon = loc.substring(comma + 1).toFloat(); }
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) +
+               "&longitude=" + String(lon, 4) + "&current=temperature_2m,wind_speed_10m";
+  if (http.begin(client, url)) {
+    int code = http.GET();
+    if (code == 200) {
+      String body = http.getString();
+      int k = body.indexOf("\"temperature_2m\":");
+      if (k >= 0) {
+        String t = body.substring(k + 17); t = t.substring(0, t.indexOf(','));
+        notifyLine("temp " + t + " C\n");
+        notifyLine("DATA:WX:" + String(lat, 2) + "," + String(lon, 2) + "," + t + "\n");
+      } else notifyLine("wx parse?\n");
+    } else notifyLine("wx http " + String(code) + "\n");
+    http.end();
+  } else notifyLine("wx begin failed\n");
+
+  WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+  notifyLine("online done\n");
+}
+
+// --- BadUSB / HID Ducky runner (gated by the Authorize screen) --------------
+#if BADUSB_ACTIVE
+static uint8_t duckyNamed(const String &a) {
+  String u = a; u.trim(); u.toUpperCase();
+  if (u == "ENTER")  return KEY_RETURN;
+  if (u == "TAB")    return KEY_TAB;
+  if (u == "ESC" || u == "ESCAPE") return KEY_ESC;
+  if (u == "DELETE" || u == "DEL") return KEY_DELETE;
+  if (u == "SPACE")  return ' ';
+  if (u == "UP")     return KEY_UP_ARROW;
+  if (u == "DOWN")   return KEY_DOWN_ARROW;
+  if (u == "LEFT")   return KEY_LEFT_ARROW;
+  if (u == "RIGHT")  return KEY_RIGHT_ARROW;
+  if (u.length() == 1) return (uint8_t)a[0];
+  return 0;
+}
+static void duckyCombo(uint8_t mod, const String &arg) {
+  HidKbd.press(mod);
+  uint8_t k = duckyNamed(arg);
+  if (k) HidKbd.press(k);
+  delay(40);
+  HidKbd.releaseAll();
+}
+#endif
+
+void runDucky(String path) {
+#if BADUSB_ACTIVE
+  File f = SD.open(path);
+  if (!f) { notifyLine("DATA:ERR:dd,open\n"); return; }
+  notifyLine("badusb " + path.substring(path.lastIndexOf('/') + 1) + "\n");
+  uint32_t defDelay = 0; int n = 0;
+  while (f.available() && n < 800) {
+    String ln = f.readStringUntil('\n'); ln.trim(); n++;
+    if (!ln.length() || ln.startsWith("REM")) continue;
+    int sp = ln.indexOf(' ');
+    String cmd = (sp < 0) ? ln : ln.substring(0, sp);
+    String arg = (sp < 0) ? "" : ln.substring(sp + 1);
+    String cu = cmd; cu.toUpperCase();
+    if      (cu == "STRING")       HidKbd.print(arg);
+    else if (cu == "DELAY")        delay((uint32_t)arg.toInt());
+    else if (cu == "DEFAULTDELAY" || cu == "DEFAULT_DELAY") defDelay = arg.toInt();
+    else if (cu == "ENTER")        HidKbd.write(KEY_RETURN);
+    else if (cu == "TAB")          HidKbd.write(KEY_TAB);
+    else if (cu == "ESC" || cu == "ESCAPE") HidKbd.write(KEY_ESC);
+    else if (cu == "GUI" || cu == "WINDOWS") duckyCombo(KEY_LEFT_GUI, arg);
+    else if (cu == "CTRL" || cu == "CONTROL") duckyCombo(KEY_LEFT_CTRL, arg);
+    else if (cu == "ALT")          duckyCombo(KEY_LEFT_ALT, arg);
+    else if (cu == "SHIFT")        duckyCombo(KEY_LEFT_SHIFT, arg);
+    else notifyLine("? " + cmd + "\n");
+    if (defDelay) delay(defDelay);
+  }
+  f.close();
+  HidKbd.releaseAll();
+  notifyLine("badusb done (" + String(n) + " lines)\n");
+#else
+  (void)path;
+  notifyLine("badusb disabled\n");
+#endif
 }
 
 static const uint32_t GAP_US = 5000;
@@ -1324,6 +1526,8 @@ void drawCrowPanel(uint8_t mood, uint32_t ms) {
       dx = SWAY[(ms / 220) & 7];
       if (t < 300 || (t >= 3000 && t < 3280)) {        // two quick glances
         bmp = CROW_SCAN; w = CROW_SCAN_W; h = CROW_SCAN_H; dy -= 1;
+      } else if (t >= 4400 && t < 4700) {              // a little preen/peck down
+        bmp = CROW_HIT; w = CROW_HIT_W; h = CROW_HIT_H; dy += 1;
       } else if (t >= 6000 && t < 6500) {              // a little double wing-flap
         if (ph & 1) { bmp = CROW_FLIP; w = CROW_FLIP_W; h = CROW_FLIP_H; dy -= 2; }
         else        { bmp = CROW_IDLE; w = CROW_IDLE_W; h = CROW_IDLE_H; }
@@ -1480,10 +1684,12 @@ void fuRunPendingLocal() {
   for (int i = 0; i < FU_LOGN; i++) fuLog[i] = ""; fuLogN = 0;
   uiActionActive = true; localActive = false; fuMood = 3;
   fuActionParent = fuConfirmReturn;
-  fuActionTitle = (fuConfirmKind == 1) ? "Run script" : (fuConfirmKind == 2) ? "Play sub" : "Play IR";
+  fuActionTitle = (fuConfirmKind == 1) ? "Run script" : (fuConfirmKind == 2) ? "Play sub"
+                : (fuConfirmKind == 4) ? "BadUSB" : "Play IR";
   fuScr = S_ACTION; fuFull = true; fuDrawAction();
   if      (fuConfirmKind == 1) runScript(fuPendingPath);
   else if (fuConfirmKind == 2) playSub(fuPendingPath);
+  else if (fuConfirmKind == 4) runDucky(fuPendingPath);
   else                         irFile(fuPendingPath);
   fuMood = 1;
 }
@@ -1537,7 +1743,7 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.9");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.10");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
@@ -1618,7 +1824,8 @@ void fuStartAction(FUScreen from, int idx) {
   uiActionActive = true; localActive = true; nfcPolling = false; fuMood = 1;
   if (from == S_SUB) {
     if (idx == 2) { fuActionTitle = "Analyzer"; anaRun = true; setStatus("analyze"); }
-    else if (idx == 3) { fuActionTitle = "Waterfall"; wfRun = true; setStatus("waterfall"); setLed(6, 0, 10); }
+    else if (idx == 3) { fuActionTitle = "Waterfall"; wfMode = 0; wfRun = true; setStatus("waterfall"); setLed(6, 0, 10); }
+    else if (idx == 4) { fuActionTitle = "Full Band"; wfMode = 1; wfRun = true; setStatus("bandscan"); setLed(10, 0, 6); }
     else { fuActionTitle = (idx == 0) ? "Sub-GHz decode" : "RSSI sweep"; subScan = true; setStatus("subghz"); setLed(8, 4, 0); }
   } else if (from == S_NFC) {
     fuActionTitle = "NFC read"; nfcPolling = true; setStatus("nfc"); setLed(0, 8, 8);
@@ -1632,6 +1839,7 @@ void fuStartAction(FUScreen from, int idx) {
       case 3: fuActionTitle = "Pkt monitor"; startSniffer('M'); setStatus("pktmon");   setLed(0, 6, 8); break;
       case 4: fuActionTitle = "Deauth";      deauthRun = true; setStatus("deauth");    setLed(12, 0, 0); fuMood = 3; break;
       case 5: fuActionTitle = "Beacon spam"; beaconRun = true; setStatus("beaconspam");setLed(12, 0, 12); fuMood = 3; break;
+      case 6: fuActionTitle = "Online";      onlinePending = true; setStatus("online"); setLed(0, 6, 10); break;
     }
   } else if (from == S_BLE) {
     fuActionTitle = "BLE scan"; bleScanRun = true; setStatus("ble"); setLed(0, 0, 12);
@@ -1672,6 +1880,7 @@ void fuNestSelect() {
 }
 
 void fuBack() {
+  if (fuScr == S_TUNE)   { tuneActive = false; setStatus("idle"); applyLed(); fuScr = S_SUB; fuSel = SUB_TUNE_IDX; fuDirty = true; return; }
   if (fuScr == S_ACTION) { fuStopAction(); fuScr = fuActionParent; fuDirty = true; return; }
   if (fuScr == S_LINK)     { fuScr = S_MAIN; fuDirty = true; return; }
   if (fuScr == S_FILE)     { fuScr = S_FILEMENU; fuSel = 0; fuDirty = true; return; }
@@ -1735,6 +1944,7 @@ void fuRender() {
     case S_SCRIPT: fuDrawScripts(fuSel); break;
     case S_ACTION:  fuDrawAction(); break;
     case S_CONFIRM: fuDrawConfirm(); break;
+    case S_TUNE:    fuDrawTune(); break;
     default: break;
   }
   if (fuScr != S_BOOT) fuBorder(fuScreenHasCrow(fuScr));
@@ -1762,6 +1972,9 @@ void fuHandleInput() {
     switch (fuScr) {
       case S_MAIN: fuSel = (fuSel + d + MAIN_N) % MAIN_N; fuRowsDirty = true; break;
       case S_SUB:  fuSel = (fuSel + d + SUB_N) % SUB_N;   fuRowsDirty = true; break;
+      case S_TUNE: tuneF += TUNE_STEPS[tuneStepIdx] * d;
+                   if (tuneF < 300.0f) tuneF = 300.0f; if (tuneF > 928.0f) tuneF = 928.0f;
+                   fuDirty = true; break;
       case S_WIFI: fuSel = (fuSel + d + WIFI_N) % WIFI_N; fuRowsDirty = true; break;
       case S_SET:  fuSel = (fuSel + d + SETTINGS_N) % SETTINGS_N; fuRowsDirty = true; break;
       case S_NEST: if (nestN) { nestSel = (nestSel + d + nestN) % nestN; fuRowsDirty = true; } break;
@@ -1780,12 +1993,18 @@ void fuHandleInput() {
         else if (MAIN_GOTO[fuSel] == S_SCRIPT) { scanScripts(); fuScr = S_SCRIPT; fuSel = 0; fuDirty = true; }
         else fuEnter(MAIN_GOTO[fuSel]);
         break;
-      case S_SUB:  fuActionParent = S_SUB; fuStartAction(S_SUB, fuSel); break;
+      case S_SUB:
+        if (fuSel == SUB_TUNE_IDX) { tuneActive = true; tuneRssi = -128; setStatus("tune"); fuScr = S_TUNE; fuDirty = true; }
+        else { fuActionParent = S_SUB; fuStartAction(S_SUB, fuSel); }
+        break;
+      case S_TUNE: tuneStepIdx = (tuneStepIdx + 1) % TUNE_STEP_N; fuDirty = true; break;
       case S_NFC:  fuActionParent = S_NFC; fuStartAction(S_NFC, 0); break;
       case S_IR:   fuActionParent = S_IR;  fuStartAction(S_IR, 0); break;
       case S_BLE:  fuActionParent = S_BLE; fuStartAction(S_BLE, 0); break;
       case S_WIFI:
-        if (fuSel >= 4) { fuPendingAction = fuSel; fuConfirmKind = 0; fuConfirmReturn = S_WIFI; fuEnter(S_CONFIRM); }
+        // Only Deauth/Beacon (4,5) transmit → authorize. AP/Stations/Probes/Pkt
+        // and Clock & Weather run straight away.
+        if (fuSel == 4 || fuSel == 5) { fuPendingAction = fuSel; fuConfirmKind = 0; fuConfirmReturn = S_WIFI; fuEnter(S_CONFIRM); }
         else { fuActionParent = S_WIFI; fuStartAction(S_WIFI, fuSel); }
         break;
       case S_CONFIRM:
@@ -1803,6 +2022,7 @@ void fuHandleInput() {
           case 1:                                                                     // Play
             if      (low.endsWith(".sub")) fuLaunchLocal(2, fuFilePath, S_FILEMENU, true);
             else if (low.endsWith(".ir"))  fuLaunchLocal(3, fuFilePath, S_FILEMENU, true);
+            else if (low.endsWith(".dd"))  fuLaunchLocal(4, fuFilePath, S_FILEMENU, true);   // BadUSB → always authorize
             else if (low.endsWith(".fu"))  fuLaunchLocal(1, fuFilePath, S_FILEMENU, scriptHasTx(fuFilePath));
             else { for (int i=0;i<FU_LOGN;i++) fuLog[i]=""; fuLogN=0; uiActionActive=true; fuActionParent=S_FILEMENU; fuActionTitle="Play"; fuScr=S_ACTION; fuFull=true; fuDrawAction(); notifyLine("not playable\n"); }
             break;
@@ -1894,6 +2114,13 @@ void setup() {
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
 
+  if (BAT_ADC_PIN >= 0) { pinMode(BAT_ADC_PIN, INPUT); analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db); }
+
+#if BADUSB_ACTIVE
+  HidKbd.begin();   // add the HID keyboard interface to the composite USB device
+  USB.begin();      // CDC-on-boot stays up; this just brings up the full descriptor
+#endif
+
   fuMood = cfg.mascot; fuScr = S_MAIN; fuDirty = true; fuLastInput = millis();
   Serial.println("[ble] advertising as \"" DEV_NAME "\" (service 4fafc201).");
 }
@@ -1930,6 +2157,7 @@ void loop() {
   if (importPending)    { importPending = false; importDrop(); scanScripts(); notifyLine("DATA:IMPORT:done\n"); }
   if (listPending)      { listPending = false; scanScripts(); for (int i = 0; i < scriptN; i++) notifyLine("DATA:SCRIPT:" + scriptNames[i] + "\n"); notifyLine("DATA:SCRIPT:end\n"); }
   if (scriptRunPending) { scriptRunPending = false; String p = scriptRunPath; if (!p.startsWith("/")) p = String(SCRIPT_ROOT) + "/" + p; runScript(p); }
+  if (onlinePending)    { onlinePending = false; doOnline(); }
   if (irRxOn) irRxPump();
   if (uiActionActive && nfcPolling) { static uint32_t tN = 0; if (millis() - tN > 700) { tN = millis(); nfcPoll(); } }
 
@@ -1976,6 +2204,12 @@ void loop() {
   if (!fuDirty && fuScreenHasCrow(fuScr) && millis() - lastAnim > 70) {
     lastAnim = millis();
     drawCrowPanel(fuCrowMood(), millis());
+  }
+
+  // ---- free-tune dial: live RSSI poll while the dial is up ----
+  if (fuScr == S_TUNE && tuneActive) {
+    static uint32_t lastTune = 0;
+    if (millis() - lastTune > 140) { lastTune = millis(); tuneServiceStep(); }
   }
 
   static uint32_t lastStat = 0;
