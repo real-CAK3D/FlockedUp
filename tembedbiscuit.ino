@@ -367,14 +367,15 @@ void setStatus(const char *o) {
     // Richer per-board health so the app can tell whether a board is working:
     // live heap (memory-leak/health), uptime (crash/reboot detection), and the
     // state of each radio/peripheral (sd/cc1101/nfc) plus the link gate.
-    String j = "{\"status\":0,\"battery\":";
-    j += String(readBatteryPct());
+    int sc = (strcmp(o, "idle") == 0 || o[0] == 0) ? 1 : 2;   // 1 = Ready, 2 = Busy
+    String j = "{\"status\":"; j += String(sc);
+    j += ",\"battery\":"; j += String(readBatteryPct());
     j += ",\"op\":\"";
     j += o; j += "\",\"heap\":"; j += String(ESP.getFreeHeap());
     j += ",\"uptime\":"; j += String(millis() / 1000);
-    j += ",\"sd\":"; j += (sdok ? 1 : 0);
-    j += ",\"cc1101\":"; j += (cc1101ok ? 1 : 0);
-    j += ",\"nfc\":"; j += (nfcok ? 1 : 0);
+    j += ",\"sd\":"; j += (sdok ? "true" : "false");       // JSON booleans (app parses optBoolean)
+    j += ",\"cc1101\":"; j += (cc1101ok ? "true" : "false");
+    j += ",\"nfc\":"; j += (nfcok ? "true" : "false");
     j += ",\"model\":\"LilyGo T-Embed CC1101 Plus\",\"name\":\"" DEV_NAME "\",\"link\":\"";
     j += (linked ? "ok" : "required");
     j += "\"}";
@@ -1849,7 +1850,7 @@ void fuDrawAbout() {
   tft.setTextSize(2); tft.setTextColor(C_BLOOD); tft.setCursor(116, 26); tft.print("FLOCKED UP");
   tft.setTextSize(1);
   tft.setTextColor(C_INK);   tft.setCursor(118, 52); tft.print("a murder of crows");
-  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.12");
+  tft.setTextColor(C_AMBER); tft.setCursor(118, 68); tft.print("FTM  \xB7  v0.13");
   tft.setTextColor(C_DIM);   tft.setCursor(118, 90); tft.print("T-Embed CC1101 Plus");
   tft.setCursor(118, 104); tft.print("Flying Flocks fleet");
   char cc[8]; sprintf(cc, "%06u", linkCode);
@@ -2196,7 +2197,8 @@ void setup() {
   if (nfcok) nfc.SAMConfig();
 
   cc1101ok = initCC1101();
-  Serial.println(cc1101ok ? "[sub] CC1101 detected." : "[sub] CC1101 not detected.");
+  for (int i = 0; i < 4 && !cc1101ok; i++) { delay(60); cc1101ok = initCC1101(); }  // retry: SPI bus may be busy at boot
+  Serial.println(cc1101ok ? "[sub] CC1101 detected." : "[sub] CC1101 not detected (will retry on first use).");
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
