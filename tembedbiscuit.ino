@@ -342,14 +342,19 @@ void IRAM_ATTR gdo0Isr() {
 // ===========================================================================
 // Output
 // ===========================================================================
-void notifyLine(const String &line) {
+// Send over BLE + USB only. Used for telemetry/meta (health, screen-mirror) that
+// must NOT land in the on-screen action log (it would recurse into itself).
+void notifyRaw(const String &line) {
   Serial.print(line);
   if (respChar && connected) {
     respChar->setValue((uint8_t *)line.c_str(), line.length());
     respChar->notify();
     delay(6);
   }
-  if (uiActionActive) fuPushLog(line);
+}
+void notifyLine(const String &line) {
+  notifyRaw(line);
+  if (uiActionActive) fuPushLog(line);   // results show in the live action log
 }
 
 // Battery percent, or -1 when the BAT-sense pin isn't configured (don't fake it).
@@ -398,7 +403,7 @@ void emitHealth() {
   h += ",";
   h += String(readBatteryPct());   // battery % or -1 (unknown)
   h += "\n";
-  notifyLine(h);
+  notifyRaw(h);
 }
 
 // ---- Screen mirror: a compact model of the current screen so the app can render
@@ -501,7 +506,7 @@ void emitUI() {
   if (fuScr == S_TUNE) { j += ",\"f\":" + String(tuneF, 2) + ",\"rssi\":" + String(tuneRssi) + ",\"step\":" + String(TUNE_STEPS[tuneStepIdx], 2); }
   if (fuScr == S_ACTION) { j += ",\"log\":["; for (int i = 0; i < fuLogN; i++) { if (i) j += ","; j += "\"" + jesc(fuLog[i]) + "\""; } j += "]"; }
   j += "}\n";
-  notifyLine(j);
+  notifyRaw(j);
 }
 
 const char *authStr(wifi_auth_mode_t a) {
@@ -566,6 +571,8 @@ void setRfBand(float mhz) {
 }
 
 bool initCC1101() {
+  SPI.setFrequency(4000000);   // the CC1101 can't follow the 80 MHz display clock on the shared bus
+  pinMode(CC1101_CS, OUTPUT); digitalWrite(CC1101_CS, HIGH);
   ELECHOUSE_cc1101.setSpiPin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, CC1101_CS);
   ELECHOUSE_cc1101.setGDO0(CC1101_GDO0);
   ELECHOUSE_cc1101.Init();
